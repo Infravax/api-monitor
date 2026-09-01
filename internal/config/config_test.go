@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +27,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.QueueSize != 100 {
 		t.Errorf("QueueSize = %d, want 100", cfg.QueueSize)
 	}
+	if cfg.DatabaseURL != "postgres://postgres:postgres@localhost:5432/apimonitor?sslmode=disable" {
+		t.Errorf("DatabaseURL = %q, want the local-dev default", cfg.DatabaseURL)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -35,6 +39,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("HTTP_IDLE_TIMEOUT", "3s")
 	t.Setenv("WORKER_COUNT", "25")
 	t.Setenv("QUEUE_SIZE", "250")
+	t.Setenv("DATABASE_URL", "postgres://myuser:mypass@dbhost:5433/mydb?sslmode=require")
 
 	cfg := Load()
 
@@ -55,6 +60,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.QueueSize != 250 {
 		t.Errorf("QueueSize = %d, want 250", cfg.QueueSize)
+	}
+	if cfg.DatabaseURL != "postgres://myuser:mypass@dbhost:5433/mydb?sslmode=require" {
+		t.Errorf("DatabaseURL = %q, want the overridden value", cfg.DatabaseURL)
 	}
 }
 
@@ -96,5 +104,42 @@ func TestLoad_InvalidIntFallsBackToDefault(t *testing.T) {
 				t.Errorf("QueueSize = %d, want default 100", cfg.QueueSize)
 			}
 		})
+	}
+}
+
+func TestRedactDatabaseURL_HidesPassword(t *testing.T) {
+	redacted := redactDatabaseURL("postgres://myuser:supersecret@dbhost:5432/mydb?sslmode=require")
+
+	if strings.Contains(redacted, "supersecret") {
+		t.Fatalf("redactDatabaseURL() = %q, password leaked", redacted)
+	}
+	for _, want := range []string{"myuser", "dbhost", "5432", "mydb", "sslmode=require"} {
+		if !strings.Contains(redacted, want) {
+			t.Errorf("redactDatabaseURL() = %q, want it to still contain %q", redacted, want)
+		}
+	}
+}
+
+func TestRedactDatabaseURL_NoPassword(t *testing.T) {
+	redacted := redactDatabaseURL("postgres://myuser@dbhost:5432/mydb")
+	if strings.Contains(redacted, "***") {
+		t.Errorf("redactDatabaseURL() = %q, should not mask anything when there is no password", redacted)
+	}
+}
+
+func TestRedactDatabaseURL_Invalid(t *testing.T) {
+	// A control character makes url.Parse fail outright.
+	redacted := redactDatabaseURL("postgres://\x7f")
+	if redacted != "invalid" {
+		t.Errorf("redactDatabaseURL() = %q, want %q for an unparsable value", redacted, "invalid")
+	}
+}
+
+func TestConfig_LogValue_DoesNotLeakPassword(t *testing.T) {
+	cfg := Config{DatabaseURL: "postgres://myuser:supersecret@dbhost:5432/mydb"}
+
+	logged := cfg.LogValue().String()
+	if strings.Contains(logged, "supersecret") {
+		t.Fatalf("Config.LogValue() leaked the database password: %s", logged)
 	}
 }

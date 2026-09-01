@@ -7,6 +7,7 @@ package config
 
 import (
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -25,6 +26,15 @@ type Config struct {
 	// without an unbounded queue).
 	WorkerCount int
 	QueueSize   int
+	// DatabaseURL is a PostgreSQL connection string
+	// (postgres://user:password@host:port/dbname?...). It defaults to a
+	// well-known local-development convention (postgres/postgres on
+	// localhost:5432) purely for zero-config `go run` — the same
+	// "sensible default so the app runs unconfigured" philosophy as
+	// every other setting here — not something to deploy as-is. See
+	// LogValue: this must never be logged unredacted, since it typically
+	// carries a real credential.
+	DatabaseURL string
 }
 
 // Load builds a Config from environment variables, falling back to
@@ -36,6 +46,7 @@ type Config struct {
 //	HTTP_IDLE_TIMEOUT=60s
 //	WORKER_COUNT=10
 //	QUEUE_SIZE=100
+//	DATABASE_URL=postgres://postgres:postgres@localhost:5432/apimonitor?sslmode=disable
 func Load() Config {
 	return Config{
 		HTTPAddr:         getEnv("HTTP_ADDR", ":8080"),
@@ -44,11 +55,15 @@ func Load() Config {
 		HTTPIdleTimeout:  getEnvDuration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 		WorkerCount:      getEnvInt("WORKER_COUNT", 10),
 		QueueSize:        getEnvInt("QUEUE_SIZE", 100),
+		DatabaseURL:      getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/apimonitor?sslmode=disable"),
 	}
 }
 
 // LogValue lets Config be logged directly via slog without manually
-// listing each field at every call site.
+// listing each field at every call site. DatabaseURL is redacted before
+// logging (see redactDatabaseURL) — it routinely carries a real password,
+// and this is the one config value in this struct where logging it
+// verbatim would leak a credential.
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("http_addr", c.HTTPAddr),
@@ -57,7 +72,24 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("http_idle_timeout", c.HTTPIdleTimeout),
 		slog.Int("worker_count", c.WorkerCount),
 		slog.Int("queue_size", c.QueueSize),
+		slog.String("database_url", redactDatabaseURL(c.DatabaseURL)),
 	)
+}
+
+// redactDatabaseURL replaces a connection string's password (if any) with
+// "***", leaving the rest (scheme, user, host, port, dbname, query)
+// intact for debugging. If the value doesn't parse as a URL at all, it is
+// not returned verbatim — "invalid" is logged instead, so a malformed
+// value can never accidentally leak whatever it actually contains.
+func redactDatabaseURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "invalid"
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		u.User = url.UserPassword(u.User.Username(), "***")
+	}
+	return u.String()
 }
 
 func getEnv(key, fallback string) string {
