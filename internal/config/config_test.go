@@ -33,6 +33,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("HTTP_READ_TIMEOUT", "1s")
 	t.Setenv("HTTP_WRITE_TIMEOUT", "2s")
 	t.Setenv("HTTP_IDLE_TIMEOUT", "3s")
+	t.Setenv("WORKER_COUNT", "25")
+	t.Setenv("QUEUE_SIZE", "250")
 
 	cfg := Load()
 
@@ -48,6 +50,12 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	if cfg.HTTPIdleTimeout != 3*time.Second {
 		t.Errorf("HTTPIdleTimeout = %v, want 3s", cfg.HTTPIdleTimeout)
 	}
+	if cfg.WorkerCount != 25 {
+		t.Errorf("WorkerCount = %d, want 25", cfg.WorkerCount)
+	}
+	if cfg.QueueSize != 250 {
+		t.Errorf("QueueSize = %d, want 250", cfg.QueueSize)
+	}
 }
 
 func TestLoad_InvalidDurationFallsBackToDefault(t *testing.T) {
@@ -57,5 +65,36 @@ func TestLoad_InvalidDurationFallsBackToDefault(t *testing.T) {
 
 	if cfg.HTTPReadTimeout != 5*time.Second {
 		t.Errorf("HTTPReadTimeout = %v, want default 5s for invalid input", cfg.HTTPReadTimeout)
+	}
+}
+
+func TestLoad_InvalidIntFallsBackToDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"non-numeric worker count", map[string]string{"WORKER_COUNT": "not-a-number"}},
+		{"zero worker count", map[string]string{"WORKER_COUNT": "0"}},
+		{"negative worker count", map[string]string{"WORKER_COUNT": "-5"}},
+		{"non-numeric queue size", map[string]string{"QUEUE_SIZE": "not-a-number"}},
+		{"zero queue size", map[string]string{"QUEUE_SIZE": "0"}},
+		{"negative queue size", map[string]string{"QUEUE_SIZE": "-5"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			cfg := Load()
+
+			if cfg.WorkerCount != 10 {
+				t.Errorf("WorkerCount = %d, want default 10", cfg.WorkerCount)
+			}
+			if cfg.QueueSize != 100 {
+				t.Errorf("QueueSize = %d, want default 100", cfg.QueueSize)
+			}
+		})
 	}
 }
