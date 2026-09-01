@@ -309,16 +309,17 @@ func (s *Scheduler) runTarget(ctx context.Context, t target.Target) {
 // in-flight, the check's own context is canceled too, and checker.Checker
 // (M3) reports that promptly as OutcomeCanceled rather than the check
 // hanging past shutdown.
+//
+// runCheck does not itself log the check's outcome (M4 originally did).
+// As of M5, TargetChecker is typically backed by a worker.Pool, which
+// already logs "check completed" with strictly more detail (including
+// queue wait time) than the Scheduler has visibility into — logging it
+// here too would just duplicate that line for every single check. The
+// Scheduler's own logging stays focused on scheduling events (target
+// scheduled/unscheduled, pool start/stop); execution-result logging is
+// the executor's job, whichever TargetChecker implementation that is.
 func (s *Scheduler) runCheck(ctx context.Context, t target.Target) {
 	result := s.checker.Check(ctx, t)
-
-	s.logger.Info("check completed",
-		"target_id", t.ID,
-		"target_name", t.Name,
-		"outcome", result.Outcome,
-		"status_code", result.StatusCode,
-		"latency", result.Latency,
-	)
 
 	if s.onResult != nil {
 		s.onResult(result)
