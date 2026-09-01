@@ -20,6 +20,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.HTTPIdleTimeout != 60*time.Second {
 		t.Errorf("HTTPIdleTimeout = %v, want 60s", cfg.HTTPIdleTimeout)
 	}
+	if cfg.WorkerCount != 10 {
+		t.Errorf("WorkerCount = %d, want 10", cfg.WorkerCount)
+	}
+	if cfg.QueueSize != 100 {
+		t.Errorf("QueueSize = %d, want 100", cfg.QueueSize)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
