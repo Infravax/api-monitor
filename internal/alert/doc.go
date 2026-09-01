@@ -1,3 +1,4 @@
+
 // Package alert will notify external systems (starting with webhooks) when
 // an incident opens or resolves.
 //
