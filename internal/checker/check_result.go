@@ -24,11 +24,16 @@ const (
 	// all (DNS failure, connection refused, TLS error, etc.), as opposed
 	// to a response that simply never arrived in time.
 	OutcomeConnectionError Outcome = "connection_error"
+	// OutcomeCanceled means the check was aborted by the caller (e.g.
+	// process shutdown) before it could complete, as distinct from the
+	// target's own configured timeout elapsing. Conflating the two would
+	// misreport an operational abort as evidence the target is slow.
+	OutcomeCanceled Outcome = "canceled"
 )
 
 func (o Outcome) valid() bool {
 	switch o {
-	case OutcomeSuccess, OutcomeUnexpectedStatus, OutcomeTimeout, OutcomeConnectionError:
+	case OutcomeSuccess, OutcomeUnexpectedStatus, OutcomeTimeout, OutcomeConnectionError, OutcomeCanceled:
 		return true
 	default:
 		return false
@@ -58,9 +63,9 @@ var (
 	ErrInvalidOutcome       = errors.New("checker: outcome is invalid")
 	ErrNegativeLatency      = errors.New("checker: latency cannot be negative")
 	ErrStatusCodeRequired   = errors.New("checker: status code is required when outcome is success or unexpected_status")
-	ErrStatusCodeNotAllowed = errors.New("checker: status code must be absent when outcome is timeout or connection_error")
+	ErrStatusCodeNotAllowed = errors.New("checker: status code must be absent when outcome is timeout, connection_error, or canceled")
 	ErrInvalidStatusCode    = errors.New("checker: status code must be between 100 and 599")
-	ErrErrorMessageRequired = errors.New("checker: error message is required when outcome is timeout or connection_error")
+	ErrErrorMessageRequired = errors.New("checker: error message is required when outcome is timeout, connection_error, or canceled")
 	ErrErrorMessagePresent  = errors.New("checker: error message must be empty when outcome is success")
 )
 
@@ -122,7 +127,7 @@ func (r CheckResult) Validate() error {
 		if r.StatusCode < 100 || r.StatusCode > 599 {
 			return ErrInvalidStatusCode
 		}
-	case OutcomeTimeout, OutcomeConnectionError:
+	case OutcomeTimeout, OutcomeConnectionError, OutcomeCanceled:
 		if r.StatusCode != 0 {
 			return ErrStatusCodeNotAllowed
 		}

@@ -46,6 +46,14 @@ func TestNew_ValidOutcomes(t *testing.T) {
 			},
 			wantSuccess: false,
 		},
+		{
+			name: "canceled",
+			params: NewParams{
+				TargetID: "t1", Timestamp: now, Outcome: OutcomeCanceled,
+				Latency: 3 * time.Millisecond, ErrorMessage: "context canceled",
+			},
+			wantSuccess: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -116,6 +124,16 @@ func TestNew_Invalid(t *testing.T) {
 			name:    "success with error message",
 			params:  NewParams{TargetID: "t1", Timestamp: now, Outcome: OutcomeSuccess, StatusCode: 200, ErrorMessage: "should not be here"},
 			wantErr: ErrErrorMessagePresent,
+		},
+		{
+			name:    "canceled with status code",
+			params:  NewParams{TargetID: "t1", Timestamp: now, Outcome: OutcomeCanceled, StatusCode: 200, ErrorMessage: "context canceled"},
+			wantErr: ErrStatusCodeNotAllowed,
+		},
+		{
+			name:    "canceled missing error message",
+			params:  NewParams{TargetID: "t1", Timestamp: now, Outcome: OutcomeCanceled, ErrorMessage: ""},
+			wantErr: ErrErrorMessageRequired,
 		},
 	}
 

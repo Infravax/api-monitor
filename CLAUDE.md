@@ -11,22 +11,8 @@ Project: InfraVex API Monitor
 Organization: InfraVex
 Language: Go
 Module: github.com/InfraVex/api-monitor
-Current Milestone: M2 (complete)
+Current Milestone: M3 (complete)
 ```
-
-## Current Architecture
-
-Modular monolith. One binary (`cmd/api-monitor`), internal packages each
-owning one responsibility. Full design in `docs/architecture.md` (see its
-"Request architecture (Milestone 2)" section for what's actually wired up
-today vs. the target design).
-
-As of M2, a real HTTP path exists end to end:
-`net/http server → RequestID/Logging/Recovery middleware → TargetHandler →
-target.Service → Target.Validate → target.Repository →
-storage.MemoryTargetRepository`. `checker`, `scheduler`, `incident`,
-`alert` remain doc-only (M1's domain types in `checker`/`incident` are
-implemented, but nothing consumes them yet).
 
 ## Completed Milestones
 
@@ -34,143 +20,158 @@ implemented, but nothing consumes them yet).
 M0 — Foundation & Architecture
 M1 — Domain Model
 M2 — Target Management + REST Backend + Docker Foundation
+M3 — HTTP Checker
 ```
+
+## Current Architecture
+
+Modular monolith. Full design in `docs/architecture.md` — see its "The
+HTTP Checker (Milestone 3)" section for what M3 actually added, and
+"Request architecture (Milestone 2)" for the REST API path.
+
+**What's actually wired into the running application** (`cmd/api-monitor`):
+```
+net/http server → RequestID/Logging/Recovery middleware → TargetHandler
+       → target.Service → Target.Validate → target.Repository
+       → storage.MemoryTargetRepository
+```
+
+**What exists as a tested, callable component but is NOT wired into the
+running application yet:**
+```
+target.Target → checker.Checker.Check(ctx, target) → checker.CheckResult
+```
+`checker.Checker` is fully implemented and tested (see M3 Implementation
+below), but nothing in `main.go` constructs one or calls `Check`. There is
+no scheduler (M4) to invoke it periodically, no worker pool (M5) to run it
+at scale, nothing persists its output (M6), and nothing reacts to it
+(M7/M8). It is reachable today only from its own package tests.
+
+`scheduler`, `incident`, `alert` remain doc-only. `incident.Incident` (M1)
+is implemented but still has no consumer.
 
 ## Domain Model
 
-Unchanged from M1 — see `docs/architecture.md`'s "Domain model (Milestone
-1)" section for full detail. Summary:
+- **`Target`** (`internal/target`) — unchanged from M1/M2.
+- **`CheckResult`** (`internal/checker`) — **changed in M3**: added one new
+  `Outcome` value, `OutcomeCanceled` (`"canceled"`), alongside the
+  existing `success`/`unexpected_status`/`timeout`/`connection_error`.
+  Justification: the M1 enum couldn't distinguish "the target's own
+  configured `Timeout` elapsed" from "the caller aborted the check for
+  operational reasons" (e.g. process shutdown) — conflating them would
+  misreport an operational abort as target slowness in future
+  incident-detection data. `OutcomeCanceled` follows the same validation
+  rules as `timeout`/`connection_error` (no `StatusCode`, non-empty
+  `ErrorMessage`). This was a deliberately minimal, justified addition —
+  not a redesign; `Validate()`'s structure and `Success()` derivation are
+  unchanged.
+- **`Incident`** (`internal/incident`) — unchanged from M1, still unused
+  by anything.
 
-- **`Target`** (`internal/target`) — endpoint + check policy
-  (name/URL/method/interval/timeout/expected status/enabled). Validated by
-  `Target.Validate()`; constructed via `target.New(NewParams)`.
-- **`CheckResult`** (`internal/checker`) — outcome of one check attempt,
-  via a stored `Outcome` enum, not a raw `Success` bool.
-- **`Incident`** (`internal/incident`) — open/resolved period, derived
-  from `ResolvedAt == nil`, not a separate status field.
+## M3 Implementation
 
-## M2 Implementation
-
-- **HTTP server** (`internal/api/server.go`) — `net/http.Server` only, no
-  framework. Configurable `Addr`/`ReadTimeout`/`WriteTimeout`/`IdleTimeout`.
-- **Router** (`internal/api/router.go`) — Go 1.22+ `http.ServeMux` with
-  method + `{id}` path-parameter patterns; no third-party router needed.
-- **Routes**:
-  - `GET /health` — liveness only (see `docs/api.md`)
-  - `POST /api/v1/targets`, `GET /api/v1/targets`,
-    `GET /api/v1/targets/{id}`, `PUT /api/v1/targets/{id}`,
-    `DELETE /api/v1/targets/{id}`
-- **Handler** (`internal/api/target_handler.go`) — parses/validates at the
-  transport boundary (JSON decode, duration parsing, 1 MiB body cap via
-  `http.MaxBytesReader`), maps domain errors to HTTP status/JSON via
-  `writeServiceError`, contains no business logic.
-- **DTOs** (`internal/api/target_dto.go`) — `targetRequest`/
-  `targetResponse`, separate from `target.Target` for two concrete
-  reasons: (1) `time.Duration` has no built-in human-friendly JSON
-  encoding (`"30s"` on the wire vs. int64 nanoseconds internally), and (2)
-  it decouples the wire contract from the domain type's shape.
-- **Service** (`internal/target/service.go`) — `Service.{Create,Get,List,
-  Update,Delete}`, knows nothing about HTTP. `Update` fetches the existing
-  target, rebuilds it with `Target.Validate()` (not `New`, so the ID is
-  preserved), then persists.
-- **Repository interface** (`internal/target/repository.go`) —
-  `Repository` defined in `internal/target` (the consumer/owner of
-  `Target`), not in `internal/storage`. `ErrNotFound`/`ErrAlreadyExists`
-  sentinels.
-- **In-memory storage** (`internal/storage/memory_target_repository.go`) —
-  `MemoryTargetRepository`, `map[string]target.Target` behind a
-  `sync.RWMutex`. `List` sorts by Name then ID for deterministic output
-  (the domain model has no creation timestamp to sort by). Concurrency
-  verified with `go test -race`.
-- **Configuration** (`internal/config/config.go`) — env vars with
-  defaults, no framework: `HTTP_ADDR` (`:8080`), `HTTP_READ_TIMEOUT`
-  (`5s`), `HTTP_WRITE_TIMEOUT` (`10s`), `HTTP_IDLE_TIMEOUT` (`60s`).
-  Unparsable values silently fall back to the default.
-- **Middleware** (`internal/api/middleware.go`) — `RequestID` (reuses
-  `internal/id` from M1, no separate UUID dependency) → `Logging`
-  (method/path/status/duration/request_id via `log/slog`) → `Recovery`
-  (panic → 500 JSON, doesn't crash the server). Order matters: `Logging`
-  wraps `Recovery` so a recovered panic still gets an accurate status
-  logged.
-- **`main.go`** — pure wiring: loads config, builds repository → service →
-  handler → server, runs `ListenAndServe` in a goroutine, waits on
-  `signal.NotifyContext` or a server error, then `Shutdown` with a 10s
-  timeout.
-- **Docker** (`Dockerfile`, `.dockerignore`) — multi-stage:
-  `golang:1.25-alpine` build stage, `alpine:3.20` runtime stage, non-root
-  user, `HEALTHCHECK` via `wget` against `/health`. No `docker-compose.yml`
-  — not justified yet (single service, nothing to orchestrate against
-  until PostgreSQL in M6).
-
-## Important Decisions
-
-- **Standard library HTTP, no framework**: routing needs (method + one
-  path param) are fully covered by Go 1.22+'s `http.ServeMux`; a
-  framework would be a dependency with no problem left for it to solve.
-- **In-memory storage now, PostgreSQL postponed to M6**: `target.Repository`
-  is an interface, so this is a swap, not a rewrite, when M6 arrives —
-  same pattern validated by M1's prediction that `Validate()` (not just
-  `New()`) would be needed for exactly this kind of external
-  reconstruction, which `Service.Update` now actually uses.
-- **Kafka postponed**: nothing in the current architecture produces events
-  that need a broker; M9 (event-driven check results/incidents) is where
-  this becomes justified, per the roadmap re-ordering below.
-- **Still a modular monolith**: one binary, clean internal seams
-  (`Handler → Service → Repository`), no network hop between them. Not
-  revisited in M2.
-- **Roadmap re-ordering**: `docs/roadmap.md` moved the target REST API
-  and the first Docker image from their original M9/M11 slots into M2
-  itself, since M2 was the milestone that introduced the HTTP server they
-  depend on. M9 is now "Kafka / event-driven architecture" (check
-  results/incidents, building on M2's REST foundation rather than
-  duplicating it); M11 is production hardening beyond the M2 Docker
-  foundation. `docs/roadmap.md` documents this change and why.
-- **`UpdateParams` includes `Enabled`, `NewParams` does not**: a new
-  target always starts enabled (M1 decision, unchanged); an existing one
-  must be pause/resume-able via `PUT`, which is a create-vs-update
-  asymmetry, not an oversight.
-- **`Enabled *bool` in the request DTO**: distinguishes "omitted" (defaults
-  to `true`) from "explicitly `false`", for both create and update.
-- **1 MiB request body cap**: cheap, standard-library-only
-  (`http.MaxBytesReader`), and a real (if basic) protection against
-  oversized payloads now that the server accepts arbitrary client JSON.
+- **`checker.Checker`** (`internal/checker/check.go`) — a concrete
+  struct wrapping `*http.Client`, not an interface: exactly one
+  implementation exists and no current caller needs to substitute
+  another, so an interface would be unjustified abstraction.
+  `checker.NewChecker(client *http.Client) *Checker` — named `NewChecker`,
+  not `New`, because `New` already exists in this package as
+  `CheckResult`'s M1 constructor. Passing `nil` yields a plain
+  `&http.Client{}`.
+- **`Check(ctx context.Context, t target.Target) CheckResult`** — the
+  checker's only method. Returns a `CheckResult` only, never a Go
+  `error`: any failure to reach `t` or get the expected response *is* the
+  observation being reported, and lives in the returned value's
+  `Outcome`/`ErrorMessage`, not a separate error channel (this mirrors
+  `CheckResult`'s M1 no-contradictory-state design).
+- **Timeout strategy**: `context.WithTimeout(ctx, t.Timeout)` per call,
+  layered on top of whatever `ctx` already carries — **not**
+  `http.Client.Timeout`. Reason: one shared `*http.Client` is reused
+  across targets with different configured `Timeout` values; a single
+  fixed `Client.Timeout` field can't represent that. `checkCtx.Err()` /
+  the error from `client.Do` is classified via `errors.Is`:
+  `context.Canceled` → `OutcomeCanceled`; `context.DeadlineExceeded` →
+  `OutcomeTimeout`; anything else → `OutcomeConnectionError`. This
+  correctly distinguishes an externally-canceled `ctx` from `t.Timeout`
+  itself elapsing (see Domain Model above).
+- **Latency measurement**: `time.Since(start)` computed immediately after
+  `client.Do` returns (i.e. once response headers arrive), **before**
+  draining the body. Full body-transfer time is deliberately excluded —
+  M3 doesn't validate bodies, so counting drain time would make latency
+  numbers misleading for large-but-healthy responses. `start` is recorded
+  at the very top of `Check`, so even a request-construction failure gets
+  a coherent (near-zero, non-negative) latency.
+- **Status-code handling**: compares `resp.StatusCode` against
+  `t.ExpectedStatusCode` directly — no hardcoded `200`/2xx assumption
+  (`TestCheck_DifferentExpectedStatus` proves this with `201`). A
+  defensive guard rejects `resp.StatusCode` outside 100–599 (Go's HTTP
+  parser only guarantees a 3-digit code, not that range) as
+  `OutcomeConnectionError`, so a malformed/unusual server response can
+  never violate `CheckResult.Validate()`'s own invariant.
+- **Redirects**: standard `net/http` `Client` default policy (follow, cap
+  10). No custom `CheckRedirect` — most real APIs redirect legitimately
+  (e.g. http→https), and not following would misreport a healthy
+  redirect-based setup as a failure.
+- **TLS**: default system trust store, no `InsecureSkipVerify`. A cert
+  failure surfaces as a wrapped error, falling into the default
+  `OutcomeConnectionError` classification branch — no special-casing
+  needed, matches that outcome's existing M1 doc comment
+  ("...TLS error, etc.").
+- **Response body**: read via `io.Copy(io.Discard, io.LimitReader(body,
+  64*1024))` then closed, always via `defer`. Reason: draining (not just
+  closing) lets `net/http`'s transport return the connection to its
+  keep-alive pool for reuse on a future check against the same target
+  (relevant once M4 schedules repeated checks); the 64 KiB cap bounds
+  time/memory spent on unexpectedly large or slow bodies. `io.Discard`
+  never buffers the content regardless of cap size. A drain-read error is
+  deliberately ignored — headers/status were already observed by that
+  point, which is what M3 reports on.
+- **`finish` helper panics on `New`/`Validate` failure**: this is reached
+  only if `Check`'s own classification logic produced an internally
+  inconsistent combination of fields — a bug in `check.go`, not a runtime
+  condition external callers should have to handle (same reasoning as
+  `internal/id`'s panic-on-`rand.Read`-failure from M1). The 100–599
+  status guard above exists specifically so this panic path can never be
+  reached by adversarial/unusual *external* server input — only by an
+  actual bug in this file.
 
 ## Dependencies
 
 None beyond the Go standard library. `go.mod` has no `require` block, no
-`go.sum` exists. (Same as M0/M1 — still true after M2.)
+`go.sum` exists. (Unchanged since M0.)
 
 ## Verification
 
-Run from repo root:
+Run from repo root — all actually executed for M3:
 ```
-gofmt -w .            # ok, only reformatted whitespace
+gofmt -w .            # ok, only reformatted whitespace/alignment
 go vet ./...           # ok
 go build ./...          # ok
-go test ./...            # ok — all packages pass
-go test -race ./...       # ok — no data races, including the concurrent
-                          #      MemoryTargetRepository stress test
+go test ./...            # ok — all packages pass, including 12 new
+                          #      checker tests (success, unexpected status,
+                          #      different expected status, timeout,
+                          #      connection refused, cancel-before-start,
+                          #      cancel-during-request, invalid URL,
+                          #      GET/POST methods, HTTPS, concurrency)
+go test -race ./...       # ok — no data races
 ```
-Manually verified end-to-end: built the binary, ran it, and exercised the
-full CRUD flow with `curl` — `POST` create → `GET` by id → `GET` list →
-`PUT` update → `DELETE` → `GET` returns 404 → unknown id returns 404 — all
-correct status codes and JSON bodies. Confirmed graceful shutdown on
-SIGTERM.
+All checker tests use `httptest.NewServer`/`NewTLSServer` — no external
+network dependency, fully deterministic. The HTTPS test uses
+`server.Client()` (which trusts only that test server's own certificate)
+rather than `InsecureSkipVerify`, so it exercises real TLS verification.
 
-**Docker was not executed** — no Docker daemon was available in the
-environment this milestone was built in. The `Dockerfile` was written and
-reviewed carefully (multi-stage, non-root, meaningful `HEALTHCHECK`) but
-`docker build`/`docker run` have not actually been run. Verify locally
-before relying on it.
+Docker was not touched this milestone (no changes were needed) and
+remains unverified in this environment (no Docker daemon available — see
+M2 notes).
 
 ## Current Repository Structure
 
 ```
 api-monitor/
-├── cmd/api-monitor/main.go              (wiring only)
+├── cmd/api-monitor/main.go              (wiring only — does not call checker yet)
 ├── internal/
 │   ├── target/    target.go, repository.go, service.go, doc.go + tests
-│   ├── checker/   check_result.go, doc.go + tests            (M1, unused so far)
+│   ├── checker/   check_result.go, check.go (NEW M3), doc.go + tests
 │   ├── incident/  incident.go, doc.go + tests                (M1, unused so far)
 │   ├── id/        id.go                                      (shared UUID util)
 │   ├── config/    config.go + tests
@@ -187,10 +188,12 @@ api-monitor/
 
 ## Next Milestone
 
-**M3 — HTTP Checker** is next: perform real HTTP/HTTPS requests against a
-`Target` and produce a `checker.CheckResult` (the M1 type, unused until
-now). Expect this to be the first place `checker.CheckResult`'s
-`Outcome` enum actually gets set by real logic (success vs.
-unexpected_status vs. timeout vs. connection_error), and the first
-component that needs a bounded per-request timeout distinct from the HTTP
-server's own timeouts.
+**M4 — Scheduler** is next: periodically trigger `checker.Checker.Check`
+for each enabled `Target`, based on its `Interval`. This is the milestone
+that actually wires the Checker into the running application for the
+first time. Expect the first real question of how scheduled work should
+be represented (timers vs. a single loop with a priority queue) and
+whether the scheduler calls `Checker` directly or through some queuing
+mechanism — the roadmap defers worker pools to M5 and any message broker
+to M9, so M4 itself should stay a single-process, in-memory scheduling
+loop.

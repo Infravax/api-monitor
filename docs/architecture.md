@@ -1,12 +1,14 @@
 # Architecture
 
-> Status: Milestone 2 — Target Management now has a real, working REST API
-> (`internal/api`) backed by an in-memory repository (`internal/storage`).
-> The domain model (`Target`, `CheckResult`, `Incident`) is unchanged from
-> M1. Scheduling, HTTP checking, incident detection, alert delivery, and
-> durable persistence remain unimplemented — see
-> [Request architecture (Milestone 2)](#request-architecture-milestone-2)
-> below for what's actually built today, vs. the target design in
+> Status: Milestone 3 — the HTTP Checker (`checker.Checker`) is now
+> implemented: given a `target.Target`, it performs one real HTTP/HTTPS
+> request and returns a `checker.CheckResult`. It is a standalone,
+> fully-tested package-level component — nothing in the running
+> application calls it yet. No scheduler exists to invoke it periodically
+> (M4), no worker pool runs it concurrently at scale (M5), and nothing
+> persists its results (M6) or reacts to them (M7/M8). See
+> [The HTTP Checker (Milestone 3)](#the-http-checker-milestone-3) below for
+> what's actually implemented vs. the target design in
 > [Core components](#core-components).
 
 ## System overview
@@ -189,10 +191,13 @@ Management + Storage), not the full future system:
         MemoryTargetRepository (internal/storage) — in-memory only
 ```
 
-Scheduler, Checker, Result Processor, Incident Manager, and Alert Manager
-from the [Core components](#core-components) table above are **not**
-wired into this flow yet — they remain future components. So does durable
-storage: `MemoryTargetRepository` is a `map[string]Target` behind a mutex;
+Scheduler, Result Processor, Incident Manager, and Alert Manager from the
+[Core components](#core-components) table above are **not** wired into
+this flow yet — they remain future components. The Checker exists as of
+M3 (see below) but is not called from this HTTP request path at all; it is
+invoked directly by its own tests today, with nothing yet triggering it
+periodically. So does durable storage: `MemoryTargetRepository` is a
+`map[string]Target` behind a mutex;
 data is lost on restart. It exists to unblock the REST API before
 PostgreSQL arrives (M6), implementing `target.Repository` — an interface
 defined by `internal/target` (the consumer), not by `internal/storage`,
@@ -213,3 +218,74 @@ Configuration (`internal/config`) and cross-cutting HTTP middleware
 (request ID, structured logging, panic recovery — `internal/api`) round
 out the M2 additions; both are described in `docs/development.md` and
 `docs/api.md`.
+
+## The HTTP Checker (Milestone 3)
+
+```
+Target
+   │
+   ▼
+checker.Checker.Check(ctx, target)
+   │
+   ▼
+HTTP/HTTPS request (net/http, context-bounded by target.Timeout)
+   │
+   ▼
+External API under test
+   │
+   ▼
+Response / error
+   │
+   ▼
+CheckResult (Outcome: success | unexpected_status | timeout |
+             connection_error | canceled)
+```
+
+`checker.Checker` (`internal/checker/check.go`) answers exactly one
+question — *"what happened when we attempted this request?"* — and
+nothing else. It is deliberately kept separate from, and unaware of, the
+**Incident Manager**: the Checker reports an observation; deciding what a
+sequence of observations *means* for a target's overall UP/DOWN state is
+the Incident Manager's job (M7), not the Checker's. This mirrors the
+`Handler`/`Service` split from M2: each layer answers one question and
+defers judgment calls to whichever layer actually owns them.
+
+Key design points (see `internal/checker/check.go`'s doc comments for the
+full reasoning):
+
+- **Concrete type, not an interface.** There is exactly one
+  implementation of "perform an HTTP check," and no current caller needs
+  to substitute a different one — an interface here would be abstraction
+  without a reason (`docs/development.md`, principle 6).
+- **Per-check context timeout, not `http.Client.Timeout`.** A single
+  `*http.Client` is shared across targets with different configured
+  `Timeout` values, so the timeout budget is applied per call via
+  `context.WithTimeout(ctx, target.Timeout)`, not as a single fixed value
+  on the client.
+- **`OutcomeCanceled` (new in M3).** The M1 `Outcome` enum could not
+  distinguish "the target's own configured timeout elapsed" from "the
+  caller aborted the check for operational reasons" (e.g. process
+  shutdown). Conflating them would corrupt future incident-detection data
+  by misreporting an operational abort as target slowness, so one new
+  outcome was added — the smallest domain change that made the
+  distinction representable, not a redesign of `CheckResult`.
+- **Standard redirect/TLS behavior.** Redirects follow `net/http`'s
+  default policy (most real APIs redirect at least once, e.g. http→https);
+  TLS uses the default system trust store with no
+  `InsecureSkipVerify` — a certificate failure is a real monitoring
+  failure, reported as `connection_error`.
+- **Bounded body draining.** The response body is drained (capped at 64
+  KiB) via `io.Discard` and closed, so the underlying connection can be
+  reused on a future check against the same target, without ever buffering
+  the content — M3 does not validate response bodies.
+- **No persistence, scheduling, or logging inside the Checker.** It
+  returns a value; what happens to that value (stored, scheduled again,
+  logged, alerted on) is entirely the caller's decision, once a caller
+  exists.
+
+This does not change the [Future scaling direction](#future-scaling-direction)
+section above — `Checker.Check` was written statelessly and safely for
+concurrent use specifically so that M5's worker pool can call it from many
+goroutines without modification. That is a property that already holds
+today (verified with `go test -race`), not a promise about work still to
+come.
