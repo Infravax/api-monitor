@@ -6,8 +6,8 @@ the project in a state that builds, runs, and can be verified.
 
 | Milestone | Name | Scope |
 |---|---|---|
-| M0 | Foundation & Architecture | Project structure, Go setup, documentation, architecture. *(current)* |
-| M1 | Domain Model | `Target`, `CheckResult`, `Incident`, and related domain concepts. |
+| M0 | Foundation & Architecture | Project structure, Go setup, documentation, architecture. *(done)* |
+| M1 | Domain Model | `Target`, `CheckResult`, `Incident`, and related domain concepts. *(done)* |
 | M2 | Target Management | Create, read, update, delete and validate monitoring targets. |
 | M3 | HTTP Checker | Perform HTTP/HTTPS checks, measure latency, handle timeout/errors. |
 | M4 | Scheduler | Periodically schedule monitoring checks. |
@@ -22,6 +22,8 @@ the project in a state that builds, runs, and can be verified.
 
 ## Current status
 
-Milestone 0 is complete: the repository, Go module, package skeletons, and
-documentation exist. No monitoring functionality is implemented yet —
-that begins at Milestone 1.
+Milestone 1 is complete: the `Target`, `CheckResult`, and `Incident`
+domain types exist with validated invariants and unit tests, in
+`internal/target`, `internal/checker`, and `internal/incident`
+respectively. No target CRUD, HTTP checking, scheduling, persistence,
+alerting, or REST API exists yet — those begin at Milestone 2 onward.

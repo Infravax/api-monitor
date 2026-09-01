@@ -1,9 +1,6 @@
-// Package checker will perform the actual HTTP/HTTPS request against a
-// target and measure the outcome: latency, response status, connection
-// errors, and timeouts.
-//
-// It has no knowledge of scheduling, storage, or incidents — its only job
-// is "given a target, run one check and report the raw result."
-//
-// Not yet implemented (Milestone 0 is documentation-only for this package).
+// Package checker owns the CheckResult domain type: the outcome of one
+// monitoring attempt against a target. In a later milestone this package
+// will also perform the actual HTTP/HTTPS request that produces a
+// CheckResult; for now it only defines the result shape and its
+// invariants.
 package checker

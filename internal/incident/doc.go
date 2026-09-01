@@ -1,9 +1,6 @@
-// Package incident will translate a stream of check results into UP/DOWN
-// state for a target, applying failure/recovery thresholds, and will own
-// the lifecycle of an incident (opened, ongoing, resolved).
-//
-// It consumes results produced by the checker/result-processing path and
-// emits state transitions for the alert manager to act on.
-//
-// Not yet implemented (Milestone 0 is documentation-only for this package).
+// Package incident owns the Incident domain type: a period during which a
+// target is considered unhealthy. In a later milestone (M7) this package
+// will also apply failure/recovery thresholds to a stream of check results
+// to decide when to open or resolve an incident; for now it only defines
+// the incident shape, its invariants, and the open/resolve transition.
 package incident

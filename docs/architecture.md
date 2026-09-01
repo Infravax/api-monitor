@@ -1,8 +1,11 @@
 # Architecture
 
-> Status: Milestone 0 — this document describes the intended architecture.
-> None of the components below are functionally implemented yet; only their
-> package boundaries exist in the repository.
+> Status: Milestone 1 — the component descriptions below are still the
+> target design. As of M1, only the **domain model** (`Target`,
+> `CheckResult`, `Incident`) is actually implemented, living in the
+> `target`, `checker`, and `incident` packages respectively. Scheduling,
+> HTTP checking, persistence, alert delivery, and the REST API remain
+> unimplemented.
 
 ## System overview
 
@@ -110,3 +113,46 @@ is a matter of changing *wiring*, not rewriting logic:
 None of this distributed infrastructure is built now. It is a direction the
 package boundaries are chosen to keep open, not a plan being implemented in
 Milestone 0.
+
+## Domain model (Milestone 1)
+
+Three domain types now exist, each owned by the package most responsible
+for producing or acting on it:
+
+```
+Target
+   │
+   │ monitored by (Scheduler triggers Checker against it — M3/M4)
+   ↓
+CheckResult
+   │
+   │ contributes to (Incident Manager applies thresholds — M7)
+   ↓
+Incident
+```
+
+- **`Target`** (`internal/target`) — an HTTP/HTTPS endpoint to check, plus
+  the policy for checking it (method, interval, timeout, expected status).
+- **`CheckResult`** (`internal/checker`) — the outcome of one check
+  attempt. Represented via a stored `Outcome` enum (`success`,
+  `unexpected_status`, `timeout`, `connection_error`) rather than a raw
+  `Success` bool, so a result can't represent a contradictory state (e.g.
+  "successful" with an error message attached). `Success()` is derived from
+  `Outcome`.
+- **`Incident`** (`internal/incident`) — a period during which a target is
+  considered unhealthy. Open vs. resolved is represented solely by whether
+  `ResolvedAt` is nil, not a separate status field, for the same
+  no-contradictory-state reason. Resolving is a one-way transition in this
+  milestone: a resolved incident is terminal, and a later recurrence
+  becomes a new incident rather than reopening the old one. The
+  failure/recovery *threshold* logic that decides *when* to open or resolve
+  an incident belongs to the Incident Manager (M7) — this milestone only
+  defines the shape and the open→resolved transition itself.
+
+These three packages currently have no dependencies on each other: IDs
+crossing between them (e.g. `CheckResult.TargetID`) are plain `string`
+values rather than a shared cross-package type, keeping the packages
+independently testable. A small `internal/id` leaf package (UUIDv4 via
+`crypto/rand`, no third-party dependency) is shared by all three
+constructors purely to avoid duplicating ID-generation code; it carries no
+business meaning of its own.
