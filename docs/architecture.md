@@ -1,16 +1,18 @@
 # Architecture
 
-> Status: Milestone 5 — check execution is now bounded. A worker pool
-> (`worker.Pool`) sits between the Scheduler and the Checker: the
-> Scheduler still decides *when* a target is due, but the actual HTTP
-> check now runs on one of a fixed number of pool workers instead of
-> directly in the Scheduler's own per-target goroutine, capping total
-> concurrent checks regardless of how many targets exist. Nothing
-> persists results (M6), and nothing interprets them (M7/M8) — a produced
-> `CheckResult` currently only reaches an optional callback, which the
-> application leaves unset today. See
-> [The Worker Pool (Milestone 5)](#the-worker-pool-milestone-5) below for
-> what's actually implemented vs. the target design in
+> Status: Milestone 6 — targets are now durably persisted in PostgreSQL
+> instead of memory: a target created through the REST API survives an
+> application restart. `target.Repository` (M2) gained its second
+> implementation, `postgres.TargetRepository`, alongside the still-present
+> in-memory one — `target.Service`, `internal/api`, and
+> `internal/scheduler` needed no changes to support it, the same
+> interface-boundary pattern that made M5's worker pool a clean swap
+> rather than a rewrite. `CheckResult`s are still not persisted (that's a
+> different table/repository, not built yet) and nothing interprets them
+> (M7/M8) — a produced `CheckResult` currently only reaches an optional
+> callback, which the application leaves unset today. See
+> [PostgreSQL Persistence (Milestone 6)](#postgresql-persistence-milestone-6)
+> below for what's actually implemented vs. the target design in
 > [Core components](#core-components).
 
 ## System overview
@@ -163,7 +165,7 @@ independently testable. A small `internal/id` leaf package (UUIDv4 via
 constructors purely to avoid duplicating ID-generation code; it carries no
 business meaning of its own.
 
-## Request architecture (Milestone 2)
+## Request architecture (Milestone 2, storage updated in Milestone 6)
 
 This is what's actually running today for target management — a real
 subset of the [Core components](#core-components) design above (Target
@@ -190,7 +192,11 @@ Management + Storage), not the full future system:
                 target.Repository interface (internal/target)
                       │
                       ▼
-        MemoryTargetRepository (internal/storage) — in-memory only
+        postgres.TargetRepository (internal/storage/postgres) — used by
+        main.go as of M6; MemoryTargetRepository (internal/storage) still
+        exists and satisfies the same interface, used only where an
+        in-memory implementation is genuinely useful (e.g. handler tests
+        that don't want a database dependency)
 ```
 
 Result Processor, Incident Manager, and Alert Manager from the
@@ -199,14 +205,19 @@ this flow yet — they remain future components. The Scheduler and Checker
 exist as of M4/M3 (see below), but neither is part of this HTTP request
 path at all — the Scheduler runs as its own independent loop, started
 alongside the HTTP server in `main.go`, not triggered by any REST request.
-Durable storage doesn't exist yet either: `MemoryTargetRepository` is a
-`map[string]Target` behind a mutex;
-data is lost on restart. It exists to unblock the REST API before
-PostgreSQL arrives (M6), implementing `target.Repository` — an interface
-defined by `internal/target` (the consumer), not by `internal/storage`,
-so `target` and `api` never depend on a specific storage technology and
-swapping in a PostgreSQL-backed implementation in M6 requires no changes
-above the repository layer.
+
+**Durable storage arrived in M6.** Through M5, `MemoryTargetRepository`
+(a `map[string]Target` behind a mutex) was the only implementation, and
+data was lost on every restart. As of M6, `main.go` wires in
+`postgres.TargetRepository` instead — a target created through the REST
+API now survives an application restart (verified in
+`internal/storage/postgres/e2e_test.go`'s `TestE2E_DataSurvivesRestart`,
+against a real PostgreSQL instance, not a mock). Both implementations
+satisfy `target.Repository` — an interface defined by `internal/target`
+(the consumer), not by `internal/storage` — identically, so `target.Service`
+and `internal/api` needed zero changes to support the swap. See
+[PostgreSQL Persistence (Milestone 6)](#postgresql-persistence-milestone-6)
+below for the new implementation's own design.
 
 The **`Handler → Service → Repository`** split mirrors the same
 single-reason-to-change principle as the top-level component table:
@@ -546,3 +557,189 @@ discrete events (`worker pool started/stopped`, `worker started/stopped`,
 `check completed`, and a `Warn` when a submission has to wait for queue
 capacity), which is enough for now but not a substitute for actual
 observability tooling.
+
+## PostgreSQL Persistence (Milestone 6)
+
+```
+                       REST API (internal/api)
+                          │
+                          ▼
+                    target.Service (internal/target)
+                          │
+                          ▼
+                  target.Repository interface (internal/target)
+                          │
+                          ▼
+               postgres.TargetRepository (internal/storage/postgres)
+                          │
+                          ▼
+                    PostgreSQL (targets table)
+```
+
+```
+        internal/scheduler  ──────▶  worker.Pool  ──────▶  checker.Checker
+   (target.Service.List() reaches   (unchanged, M5)          (unchanged, M3)
+    the same PostgreSQL-backed
+    repository above — nothing
+    else in this chain touches
+    the database)
+```
+
+`postgres.TargetRepository` (`internal/storage/postgres`) answers the
+same question `storage.MemoryTargetRepository` (M2) already answered — how
+to store and retrieve `target.Target` values — just durably. It implements
+`target.Repository` and nothing more: no SQL leaks into `internal/api`,
+`internal/target`, or `internal/scheduler`, matching the M6 brief's
+explicit requirement that handlers and the scheduler never execute SQL
+directly.
+
+**How persisted targets reach the Scheduler**: no special "load on
+startup" step was added. The Scheduler already re-lists targets via
+`TargetLister.List()` — once immediately when `Start` is called, and
+every `DiscoveryInterval` after that (M4) — so the very first
+reconciliation pass after a restart naturally returns whatever was
+persisted before the restart. This is the second time a later milestone's
+requirement (M6: "targets must be available to the Scheduler on startup")
+turned out to already be satisfied by an earlier milestone's design (M4's
+polling-based discovery), without new code — the same story as M5's
+worker pool needing no `internal/scheduler` changes.
+
+Key design points (see `internal/storage/postgres/*.go`'s doc comments
+for the full reasoning):
+
+- **Driver: `pgx` (`github.com/jackc/pgx/v5`), used natively — not
+  wrapped in `database/sql`.** PostgreSQL has no standard-library driver,
+  so unlike every dependency decision before M6, a third-party one is
+  actually justified here (see `docs/development.md`, principle 3). `pgx`
+  was chosen over the older `lib/pq` (in maintenance mode, not
+  recommended for new projects) as the actively-maintained, de facto
+  standard choice, with first-class `context.Context` support and its own
+  connection pool (`pgxpool`). Going native rather than through
+  `database/sql` avoids an abstraction layer with no current purpose —
+  nothing in this project needs to swap PostgreSQL for a different
+  database. The dependency surface was checked with `go list -deps`, not
+  assumed: pgx itself pulls in only a handful of small, purpose-built
+  packages (connection pooling, `.pgpass` support), not a large tree.
+- **Migrations: `golang-migrate/migrate`, embedded, run at application
+  startup.** A real migration tool, not a hand-rolled one — per the M6
+  brief's explicit instruction. Migration SQL files live in
+  `internal/storage/postgres/migrations/` and are embedded into the
+  compiled binary via `//go:embed`, so the Docker image and `go run` both
+  work with zero extra file-mounting or path configuration. Migrations
+  run automatically each time the application starts
+  (`postgres.Migrate`), before the repository is constructed — simplest
+  possible design (schema is always in sync with what the running binary
+  expects, no separate manual step to forget) at the scale this project
+  operates at. `migrate`'s own `ErrNoChange` (nothing pending) is treated
+  as success, so this is safe to run on every startup, not just the
+  first.
+- **Migrations use a separate, short-lived `database/sql` connection
+  from the application's long-lived `pgxpool.Pool`.** `golang-migrate`'s
+  database driver is built on `database/sql`, so migrations open their
+  own connection via `pgx/v5/stdlib` (which self-registers a `database/sql`
+  driver), run once, and close — entirely separate from the
+  `pgxpool.Pool` constructed afterward for the application's actual
+  runtime queries. There's no reason for a one-time startup step and a
+  process-lifetime connection pool to share a connection.
+- **Schema maps `target.Target` field-for-field — no invented columns.**
+  `id UUID`, `name/url/method TEXT`, `interval_ns/timeout_ns BIGINT`
+  (raw nanoseconds — `time.Duration`'s own unit, so there's no
+  conversion step or precision loss), `expected_status_code INTEGER`,
+  `enabled BOOLEAN`. Verified empirically (not assumed) that `pgx` scans
+  a `uuid` column directly into a Go `string` with an exact round trip.
+  Deliberately **no** `created_at`/`updated_at` columns: the Go domain
+  type doesn't have them (a decision M1 made explicitly and M6's own
+  brief reinforced — "do not invent fields that do not exist"), and
+  columns nothing in the application reads or writes would be exactly the
+  kind of speculative addition this project avoids elsewhere.
+- **Database-level constraints protect structural invariants, not
+  business rules.** `NOT NULL` on every column, `CHECK` constraints on
+  the numeric ranges that are already domain invariants
+  (`interval_ns > 0`, `timeout_ns > 0`, `expected_status_code BETWEEN 100
+  AND 599`) as defense-in-depth against direct/buggy writes, and the
+  primary key for uniqueness. Deliberately **not** duplicated: `method`'s
+  allowed-verb set (GET/POST/etc.) — that's `Target.Validate`'s (M1) job,
+  re-litigating it as a `CHECK` constraint would just be two sources of
+  truth for the same rule. No `UNIQUE` constraint on `name` or `url`
+  either — nothing in the Go domain model requires target names or URLs
+  to be unique, so adding one at the database layer would invent a new
+  rule, not enforce an existing one.
+- **Error mapping keeps PostgreSQL-specific errors inside the repository.**
+  A unique-violation (SQLSTATE `23505`, checked via the well-known
+  `jackc/pgerrcode` constant — already an unavoidable transitive
+  dependency of `golang-migrate`'s own pgx driver, so using it directly
+  here adds no new dependency surface) maps to `target.ErrAlreadyExists`;
+  `pgx.ErrNoRows` maps to `target.ErrNotFound`. `target.Service` never
+  needs to know it's talking to PostgreSQL.
+- **No transactions.** Every repository method is a single SQL statement
+  (`INSERT`, one `SELECT`, `UPDATE`, `DELETE`) — there is no
+  multi-statement operation in M6 that needs multiple writes to succeed
+  or fail together, so a transaction would add ceremony with no current
+  correctness benefit. `Update`/`Delete` check `RowsAffected() == 0` to
+  detect "no such row" rather than a separate existence check, avoiding a
+  check-then-act race a transaction-free design might otherwise have.
+- **Explicit `ORDER BY name, id` for `List`, not PostgreSQL's incidental
+  row order.** Kept identical to `MemoryTargetRepository`'s own ordering
+  (name, then id — see that type's doc comment for why: the domain model
+  has no creation timestamp to order by instead) so the REST API's `GET
+  /api/v1/targets` behaves the same regardless of which repository
+  backs it.
+- **One index: the implicit primary key index on `id`.** No index was
+  added to support `ORDER BY name, id` — a full-table scan and sort is
+  entirely appropriate at this milestone's scale, and optimizing a query
+  with no measured cost problem would be premature. An index on
+  `enabled` is a plausible future need once the Scheduler queries "only
+  enabled targets" directly in SQL instead of filtering in Go after a
+  full `List()` — it doesn't do that today, so it isn't added yet.
+- **Connection pool: `MaxConns = 10`, not exposed as an environment
+  variable yet.** M6's actual database load is REST API target CRUD plus
+  the Scheduler's periodic `List()` calls — comparatively low-volume; the
+  worker pool and checker don't touch the database at all. An explicit,
+  documented constant was chosen over silently relying on `pgxpool`'s own
+  default (`max(4, runtime.NumCPU())`) so the reasoning is visible; it
+  isn't a new config knob because nothing has yet demonstrated a need to
+  tune it (`docs/development.md`, principle 6).
+- **`NewPool` fails fast, with a bounded connectivity check.** A `Ping`
+  with a 5-second timeout runs before `NewPool` returns, so a
+  misconfigured or unreachable database is caught at startup —
+  `main.go` logs the error and exits non-zero — rather than the
+  application starting and silently failing the first real request that
+  touches storage. Verified directly: stopping PostgreSQL and starting
+  the application produces an immediate, clear failure and non-zero exit,
+  not a hang or a silent partial start.
+- **Graceful shutdown order: HTTP server → Scheduler → worker pool →
+  database pool.** The database pool is closed last, deliberately, since
+  `target.Service` (reached only through the HTTP server, already
+  stopped by that point, and through the Scheduler, also already
+  stopped) is the only consumer of it in this process — the worker pool
+  and checker never touch the database, so there's no risk of closing
+  the pool while something still needs it. Verified by manually starting
+  the application, sending `SIGTERM`, and confirming the log order:
+  `worker pool stopped` → `scheduler stopped cleanly` → `worker pool
+  stopped cleanly` → `database connection pool closed`.
+- **Docker Compose exists now because there is finally something to
+  orchestrate.** `docker-compose.yml` defines `postgres` (pinned to
+  `16.4`, not `latest`; named volume `postgres_data` for data that
+  survives `docker compose down` — only `down -v` destroys it; a
+  `pg_isready` healthcheck) and `api-monitor`, with `depends_on:
+  condition: service_healthy` so Compose itself — not custom
+  wait-for-it/retry logic — ensures the application container never
+  starts trying to connect before PostgreSQL is actually ready. Real
+  secrets are never committed: `.env.example` holds placeholders only,
+  `.env` is gitignored.
+- **`/health` is unchanged — still pure liveness, not made
+  PostgreSQL-aware.** This is a deliberate scope decision, not an
+  oversight: `docs/api.md` already flagged in M2 that a readiness check
+  was deferred until there was a real dependency to be "not ready" for;
+  now there is one, but adding a proper liveness/readiness split is left
+  to M10 (Observability) rather than folded into M6. Container startup
+  ordering (the actual problem a readiness check would solve here) is
+  already handled by Compose's `depends_on: condition: service_healthy`
+  on the *postgres* container, which doesn't require the application's
+  own health endpoint to change at all.
+
+Not built in M6, on purpose: persisting `CheckResult`s (the `OnResult`
+callback from M4/M5 remains unset — that needs its own table/repository,
+not a repurposing of `TargetRepository`), Kafka, an ORM, connection-pool
+tuning exposed as configuration, and any change to `target.Repository`'s
+interface itself (M6 was a pure implementation swap).

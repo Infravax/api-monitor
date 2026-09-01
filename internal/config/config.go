@@ -77,7 +77,7 @@ func (c Config) LogValue() slog.Value {
 }
 
 // redactDatabaseURL replaces a connection string's password (if any) with
-// "***", leaving the rest (scheme, user, host, port, dbname, query)
+// "REDACTED", leaving the rest (scheme, user, host, port, dbname, query)
 // intact for debugging. If the value doesn't parse as a URL at all, it is
 // not returned verbatim — "invalid" is logged instead, so a malformed
 // value can never accidentally leak whatever it actually contains.
@@ -87,7 +87,7 @@ func redactDatabaseURL(raw string) string {
 		return "invalid"
 	}
 	if _, hasPassword := u.User.Password(); hasPassword {
-		u.User = url.UserPassword(u.User.Username(), "***")
+		u.User = url.UserPassword(u.User.Username(), "REDACTED")
 	}
 	return u.String()
 }

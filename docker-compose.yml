@@ -1,0 +1,50 @@
+# Local development / full-stack infrastructure testing. See
+# docs/development.md for when to use this vs. `go run` directly.
+#
+# Data persistence:
+#   docker compose down     removes containers; the postgres_data volume
+#                            (and its data) survives.
+#   docker compose down -v  also removes the volume — this destroys all
+#                            PostgreSQL data. Only use it deliberately.
+services:
+  postgres:
+    image: postgres:16.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-apimonitor}
+      POSTGRES_USER: ${POSTGRES_USER:-apimonitor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-apimonitor} -d ${POSTGRES_DB:-apimonitor}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api-monitor:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Overrides the image's own DATABASE_URL default (postgres/postgres
+      # on localhost — meaningless inside a container anyway, since there
+      # is no "localhost" postgres here): "postgres" below is this
+      # Compose file's service name, resolved via Compose's internal DNS.
+      DATABASE_URL: ${DATABASE_URL:-postgres://apimonitor:changeme@postgres:5432/apimonitor?sslmode=disable}
+      HTTP_ADDR: :8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        # Compose's own dependency mechanism: "started" only means the
+        # postgres container's process began running, not that PostgreSQL
+        # is actually accepting connections yet. "service_healthy" makes
+        # Compose wait for the healthcheck above to pass first, so
+        # api-monitor never even starts trying to connect before
+        # PostgreSQL is really ready — no custom retry/wait script needed.
+        condition: service_healthy
+
+volumes:
+  postgres_data:

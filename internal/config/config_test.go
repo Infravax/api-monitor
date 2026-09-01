@@ -122,7 +122,7 @@ func TestRedactDatabaseURL_HidesPassword(t *testing.T) {
 
 func TestRedactDatabaseURL_NoPassword(t *testing.T) {
 	redacted := redactDatabaseURL("postgres://myuser@dbhost:5432/mydb")
-	if strings.Contains(redacted, "***") {
+	if strings.Contains(redacted, "REDACTED") {
 		t.Errorf("redactDatabaseURL() = %q, should not mask anything when there is no password", redacted)
 	}
 }

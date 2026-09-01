@@ -12,8 +12,8 @@ the project in a state that builds, runs, and can be verified.
 | M3 | HTTP Checker | Perform one real HTTP/HTTPS check against a `Target`, measure latency, classify timeout/connection/status outcomes. *(done)* |
 | M4 | Scheduler | Periodically trigger the M3 Checker for each enabled target on its own configured interval; wire it into the running application. *(done)* |
 | M5 | Worker Pool + Concurrent Check Execution | Bound total concurrent check execution with a fixed-size worker pool and a bounded queue, replacing the Scheduler's previously-unbounded per-target goroutine execution. *(done)* |
-| M6 | Persistence | PostgreSQL, schema design, migrations, repositories (replacing the M2 in-memory one), Docker Compose. |
-| M7 | Health & Incident Engine | UP/DOWN state transitions, failure thresholds and recovery. |
+| M6 | PostgreSQL Persistence + Docker Compose | Durable `target.Repository` implementation backed by PostgreSQL (replacing the M2 in-memory one for production use), embedded migrations, and `docker-compose.yml` wiring the API service to a real Postgres container. *(done)* |
+| M7 | Incident Engine | UP/DOWN state transitions, failure thresholds and recovery. |
 | M8 | Alerting | Webhook-based alerts and alert deduplication. |
 | M9 | Kafka / Event-driven architecture | Event-driven pipeline for check results/incidents; querying endpoints beyond the target CRUD already built in M2. |
 | M10 | Observability | Metrics, tracing, health/readiness endpoints (readiness becomes meaningful once M6 adds a real dependency to check). |
@@ -27,29 +27,28 @@ server they depend on.
 
 ## Current status
 
-Milestone 5 is complete: `worker.Pool` (`internal/worker/pool.go`) bounds
-how many checks run concurrently — a fixed number of workers
-(`WORKER_COUNT`, default 10) pull from a bounded queue
-(`QUEUE_SIZE`, default 100). `cmd/api-monitor/main.go` now wires the
-Scheduler's `Checker` to the pool instead of directly to
-`checker.Checker`; **`internal/scheduler` itself required no code
-changes**, since `worker.Pool` implements the same `TargetChecker`
-interface the Scheduler has depended on since M4. Backpressure blocks the
-submitting goroutine rather than dropping checks; at most one check per
-target is ever outstanding (queued or running) at a time, preserved from
-M4; a panic during a check is recovered and logged, not left to crash a
-worker.
+Milestone 6 is complete: targets created through the REST API now survive
+an application restart. `postgres.TargetRepository`
+(`internal/storage/postgres`) is a second implementation of
+`target.Repository` — PostgreSQL-backed, using `pgx` natively and
+`golang-migrate` for embedded, startup-run schema migrations —
+alongside the still-present in-memory one from M2. `cmd/api-monitor/main.go`
+now wires in the PostgreSQL repository; **`target.Service`,
+`internal/api`, and `internal/scheduler` needed zero code changes**, the
+same interface-boundary pattern that made M5's worker pool a clean swap.
+The application now fails fast with a clear error and non-zero exit if
+PostgreSQL is unreachable or migrations fail at startup, rather than
+starting in a silently-broken state. `docker-compose.yml` wires the API
+service to a real `postgres:16.4` container with a named volume (data
+survives `docker compose down`; only `down -v` destroys it) and a
+healthcheck-gated startup order.
 
-`CheckResult`s are not yet persisted (M6) or interpreted (M7/M8) — they
-currently only reach an optional, unset-by-default `OnResult` callback and
-the pool's own "check completed" log line (moved there from the
-Scheduler this milestone, to avoid double-logging every check once the
-pool sat between them).
+`CheckResult`s are still not persisted — that needs its own table/
+repository, not built in M6 — and nothing interprets them yet (M7/M8).
+They currently only reach an optional, unset-by-default `OnResult`
+callback and the worker pool's own "check completed" log line (M5).
 
-M2's target management REST API, M3's Checker, and M4's Scheduler
-reconciliation logic are otherwise unchanged:
-`POST/GET/PUT/DELETE /api/v1/targets` and `GET /health` remain backed by
-`target.Service` → `target.Repository` → `storage.MemoryTargetRepository`
-(concurrency-safe, in-memory); `checker.Checker` remains a concrete,
-stateless, concurrency-safe HTTP/HTTPS checker, now called from a pool
-worker instead of directly from the Scheduler.
+M2's target management REST API contract, M3's Checker, M4's Scheduler
+reconciliation logic, and M5's worker pool are otherwise unchanged:
+`POST/GET/PUT/DELETE /api/v1/targets` and `GET /health` behave exactly as
+before, now backed by PostgreSQL instead of memory by default.

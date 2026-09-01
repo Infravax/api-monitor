@@ -17,19 +17,47 @@ import (
 	"github.com/InfraVex/api-monitor/internal/checker"
 	"github.com/InfraVex/api-monitor/internal/config"
 	"github.com/InfraVex/api-monitor/internal/scheduler"
-	"github.com/InfraVex/api-monitor/internal/storage"
+	"github.com/InfraVex/api-monitor/internal/storage/postgres"
 	"github.com/InfraVex/api-monitor/internal/target"
 	"github.com/InfraVex/api-monitor/internal/worker"
 )
 
+// dbConnectTimeout bounds how long startup waits for PostgreSQL to become
+// reachable before giving up. This is a startup-only concern — once
+// connected, the pool's own settings (internal/storage/postgres) govern
+// individual query timeouts, not this constant.
+const dbConnectTimeout = 10 * time.Second
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	logger.Info("infravex api-monitor starting", "milestone", "M5")
+	logger.Info("infravex api-monitor starting", "milestone", "M6")
 
 	cfg := config.Load()
 	logger.Info("configuration loaded", "config", cfg)
 
-	repo := storage.NewMemoryTargetRepository()
+	// PostgreSQL is the first genuinely required piece of external
+	// infrastructure this application has (see docs/architecture.md): if
+	// it can't be reached, or migrations can't run, that must stop
+	// startup here — loudly, with a non-zero exit — rather than let the
+	// application come up and silently fail every request that touches
+	// storage. Every other dependency constructed by this function is
+	// in-process and cannot fail this way.
+	connectCtx, cancel := context.WithTimeout(context.Background(), dbConnectTimeout)
+	pool, err := postgres.NewPool(connectCtx, cfg.DatabaseURL)
+	cancel()
+	if err != nil {
+		logger.Error("failed to connect to postgresql", "error", err)
+		os.Exit(1)
+	}
+
+	if err := postgres.Migrate(cfg.DatabaseURL); err != nil {
+		logger.Error("failed to run database migrations", "error", err)
+		pool.Close()
+		os.Exit(1)
+	}
+	logger.Info("database connected and migrations applied")
+
+	repo := postgres.NewTargetRepository(pool)
 	targetService := target.NewService(repo)
 	targetHandler := api.NewTargetHandler(targetService, logger)
 
@@ -40,28 +68,23 @@ func main() {
 		IdleTimeout:  cfg.HTTPIdleTimeout,
 	}, targetHandler, logger)
 
-	pool := worker.New(worker.Config{
+	workerPool := worker.New(worker.Config{
 		Checker:     checker.NewChecker(nil),
 		WorkerCount: cfg.WorkerCount,
 		QueueSize:   cfg.QueueSize,
 		Logger:      logger,
 	})
 
-	// The Scheduler's Checker is now the worker pool, not checker.Checker
-	// directly — *worker.Pool satisfies the exact same TargetChecker
-	// interface (Check(ctx, target.Target) checker.CheckResult), so
-	// internal/scheduler required no code changes at all for M5. The
-	// Scheduler still decides *when* a target is due; actual check
-	// execution now runs on a pool worker, bounded by WorkerCount, instead
-	// of directly in the Scheduler's own per-target goroutine.
-	//
 	// OnResult is left unset: nothing yet consumes a CheckResult beyond
-	// the pool's own lifecycle logging (M6 will persist results, M7/M8
-	// will react to them). This is the extension point those milestones
-	// will use.
+	// the pool's own lifecycle logging (M7/M8 will react to them; M6
+	// only persists Targets, not CheckResults, since the Scheduler and
+	// worker pool don't read or write the database at all — the only
+	// database consumer in this process is targetService, reached
+	// through the REST API). This is the extension point those future
+	// milestones will use.
 	sched := scheduler.New(scheduler.Config{
 		Targets: targetService,
-		Checker: pool,
+		Checker: workerPool,
 		Logger:  logger,
 	})
 
@@ -79,7 +102,7 @@ func main() {
 	poolDone := make(chan struct{})
 	go func() {
 		defer close(poolDone)
-		if err := pool.Start(ctx); err != nil {
+		if err := workerPool.Start(ctx); err != nil {
 			logger.Error("worker pool stopped with error", "error", err)
 		}
 	}()
@@ -111,10 +134,15 @@ func main() {
 	// The scheduler and pool both stop via the same ctx (already canceled
 	// by this point via signal.NotifyContext, or will be via stop() on
 	// return). Wait for the scheduler first — it's the one calling
-	// pool.Check — then the pool, so no goroutine outlives main.
+	// pool.Check — then the pool, then finally close the database pool:
+	// targetService (reached only through the HTTP server, already
+	// stopped, and through the scheduler, now also stopped) is the only
+	// consumer of it, so nothing can still be using it by this point.
 	stop()
 	<-schedulerDone
 	logger.Info("scheduler stopped cleanly")
 	<-poolDone
 	logger.Info("worker pool stopped cleanly")
+	pool.Close()
+	logger.Info("database connection pool closed")
 }

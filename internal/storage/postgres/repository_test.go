@@ -7,41 +7,65 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/InfraVex/api-monitor/internal/target"
 )
 
 // testDatabaseURL returns the connection string for the dedicated
-// integration-test database, and skips the calling test if none is
-// configured. This keeps these tests entirely opt-in: `go test ./...`
-// with no PostgreSQL available still passes everything else (see
-// docs/development.md), and when it does run, it never touches the
-// application's own development database — TEST_DATABASE_URL defaults to
-// a separate database name (apimonitor_test) from DATABASE_URL's default
+// integration-test database. It never touches the application's own
+// development database — TEST_DATABASE_URL defaults to a separate
+// database name (apimonitor_test) from DATABASE_URL's default
 // (apimonitor), per the project's test-isolation requirement.
 func testDatabaseURL(t *testing.T) string {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		url = "postgres://postgres:postgres@localhost:5432/apimonitor_test?sslmode=disable"
-	}
 	if os.Getenv("SKIP_POSTGRES_TESTS") != "" {
 		t.Skip("SKIP_POSTGRES_TESTS is set")
 	}
-	return url
+	if url := os.Getenv("TEST_DATABASE_URL"); url != "" {
+		return url
+	}
+	return "postgres://postgres:postgres@localhost:5432/apimonitor_test?sslmode=disable"
 }
 
-// newTestRepository runs migrations, truncates the targets table so
-// tests never see data left over from a previous run, and returns a
-// repository plus a pool the test is responsible for closing (via
-// t.Cleanup).
-func newTestRepository(t *testing.T) *TargetRepository {
+// requireDatabase returns dbURL (see testDatabaseURL) after confirming
+// PostgreSQL is actually reachable there, skipping the calling test if
+// not.
+//
+// Skipping (not failing) when the database is unreachable is what keeps
+// `go test ./...` passing cleanly on a machine with no PostgreSQL set up
+// at all (see docs/development.md), while these tests still run for
+// real, against a real database, whenever one is available. Set
+// REQUIRE_POSTGRES_TESTS to turn that skip into a hard failure instead —
+// e.g. in CI, where a missing database should be caught, not silently
+// skipped.
+func requireDatabase(t *testing.T) string {
 	t.Helper()
 	dbURL := testDatabaseURL(t)
 
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	pool, err := NewPool(ctx, dbURL)
+	if err != nil {
+		if os.Getenv("REQUIRE_POSTGRES_TESTS") != "" {
+			t.Fatalf("PostgreSQL not reachable at %s and REQUIRE_POSTGRES_TESTS is set: %v", dbURL, err)
+		}
+		t.Skipf("PostgreSQL not reachable at %s, skipping integration test (see docs/development.md): %v", dbURL, err)
+	}
+	pool.Close()
+
+	return dbURL
+}
+
+// newTestRepository connects, runs migrations, truncates the targets
+// table so tests never see data left over from a previous run, and
+// returns a repository backed by a pool the test is responsible for
+// closing (via t.Cleanup). It skips the test if PostgreSQL isn't
+// reachable — see requireDatabase.
+func newTestRepository(t *testing.T) *TargetRepository {
+	t.Helper()
+	dbURL := requireDatabase(t)
+
 	if err := Migrate(dbURL); err != nil {
-		t.Fatalf("Migrate() unexpected error (is PostgreSQL running at %s? see docs/development.md): %v", dbURL, err)
+		t.Fatalf("Migrate() unexpected error: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -222,7 +246,7 @@ func TestTargetRepository_ContextCancellation(t *testing.T) {
 }
 
 func TestMigrate_IsIdempotent(t *testing.T) {
-	dbURL := testDatabaseURL(t)
+	dbURL := requireDatabase(t)
 
 	if err := Migrate(dbURL); err != nil {
 		t.Fatalf("first Migrate() unexpected error: %v", err)
@@ -233,6 +257,10 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 }
 
 func TestNewPool_FailsFastOnUnreachableHost(t *testing.T) {
+	if os.Getenv("SKIP_POSTGRES_TESTS") != "" {
+		t.Skip("SKIP_POSTGRES_TESTS is set")
+	}
+
 	// A non-routable address (RFC 5737 TEST-NET-1) with a short context
 	// timeout proves NewPool doesn't hang or silently succeed when
 	// PostgreSQL is unreachable.
@@ -244,5 +272,3 @@ func TestNewPool_FailsFastOnUnreachableHost(t *testing.T) {
 		t.Fatal("NewPool() to an unreachable host returned no error")
 	}
 }
-
-var _ = pgxpool.Pool{} // keep the pgxpool import even if a future edit trims its direct use above

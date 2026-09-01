@@ -9,9 +9,15 @@ are not implemented yet (see `docs/roadmap.md`).
 
 ### `GET /health`
 
-Liveness only — confirms the process is up and serving HTTP. There is no
-readiness check yet because there is no external dependency (database,
-queue, etc.) to be "not ready" for in this milestone.
+Liveness only — confirms the process is up and serving HTTP. It does not
+check PostgreSQL connectivity, even though a real database dependency
+exists as of M6: a proper liveness/readiness split is deferred to M10
+(Observability), a deliberate scope decision rather than an oversight.
+Container startup ordering (waiting for PostgreSQL before starting the
+application) is instead handled by Docker Compose's own healthcheck on
+the `postgres` container plus `depends_on: condition: service_healthy` —
+see `docs/architecture.md` — which doesn't require this endpoint to
+change at all.
 
 ```
 200 OK

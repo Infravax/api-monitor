@@ -3,10 +3,11 @@
 Continuous HTTP/HTTPS API monitoring — reachability, latency, status
 correctness, uptime, and incident detection.
 
-**Status: under active development (Milestone 5). The application now
+**Status: under active development (Milestone 6). The application now
 performs real, periodic, concurrency-bounded HTTP checks against
-registered targets; incident detection, alerting, and durable persistence
-are not implemented yet.**
+registered targets, and durably persists those targets in PostgreSQL —
+they survive an application restart. Incident detection and alerting are
+not implemented yet.**
 
 ## Problem statement
 
@@ -33,16 +34,19 @@ None of this is implemented yet — see [Current status](#current-status).
 ## Current status
 
 The domain model (`Target`, `CheckResult`, `Incident`) is implemented
-(M1). Target management has a working REST API backed by in-memory
-storage (M2): create, list, get, update, and delete targets over HTTP,
-plus a `/health` liveness endpoint — see [docs/api.md](docs/api.md).
+(M1). Target management has a working REST API (M2): create, list, get,
+update, and delete targets over HTTP, plus a `/health` liveness endpoint
+— see [docs/api.md](docs/api.md).
 
-The application now actually monitors what you register: a scheduler
-(M4) periodically triggers a real HTTP/HTTPS check (M3) for every enabled
+The application actually monitors what you register: a scheduler (M4)
+periodically triggers a real HTTP/HTTPS check (M3) for every enabled
 target on its own configured interval, and a bounded worker pool (M5)
 caps how many checks run concurrently so registering many targets can't
-exhaust goroutines or connections. Results aren't persisted or
-interpreted yet — no incident detection, alerting, or durable storage
+exhaust goroutines or connections.
+
+As of M6, targets are **durably persisted in PostgreSQL** — create one,
+restart the process, and it's still there. `CheckResult`s themselves
+aren't persisted or interpreted yet — no incident detection or alerting
 exists — a check's outcome currently only reaches an internal log line.
 
 ## High-level architecture
@@ -84,10 +88,14 @@ and eventual distributed scaling.
 ## Technology choices
 
 - **Language:** Go (currently built/tested with Go 1.25.1)
-- **Dependencies:** Go standard library only, for now. Third-party packages
-  are added only when they solve a specific problem the stdlib doesn't
-  (e.g., a PostgreSQL driver, planned for M6).
-- **Persistence:** PostgreSQL (planned, M6) — not yet implemented.
+- **Dependencies:** Go standard library first. Third-party packages are
+  added only when they solve a specific problem the stdlib doesn't — as
+  of M6, that's `pgx` (PostgreSQL has no standard-library driver at all)
+  and `golang-migrate` (schema migrations). The dependency surface is
+  kept deliberately small; see `docs/architecture.md`.
+- **Persistence:** PostgreSQL (M6), via `pgx` used natively (not through
+  `database/sql`). Schema migrations are embedded in the binary and run
+  automatically at startup.
 
 ## Development roadmap
 
@@ -98,9 +106,9 @@ and eventual distributed scaling.
 | M2 | Target management + REST backend + Docker foundation *(done)* |
 | M3 | HTTP checker *(done)* |
 | M4 | Scheduler *(done)* |
-| M5 | Worker pool + concurrent check execution *(current)* |
-| M6 | Persistence (PostgreSQL) + Docker Compose |
-| M7 | Health & incident engine |
+| M5 | Worker pool + concurrent check execution *(done)* |
+| M6 | PostgreSQL persistence + Docker Compose *(current)* |
+| M7 | Incident engine |
 | M8 | Alerting |
 | M9 | Kafka / event-driven architecture |
 | M10 | Observability |
@@ -110,6 +118,11 @@ and eventual distributed scaling.
 Details in [docs/roadmap.md](docs/roadmap.md).
 
 ## How to run the current project
+
+Requires a reachable PostgreSQL instance (see `DATABASE_URL` in
+`docs/development.md`; defaults to `postgres://postgres:postgres@localhost:5432/apimonitor?sslmode=disable`
+for zero-config local development). Schema migrations run automatically
+at startup.
 
 ```bash
 go run ./cmd/api-monitor
@@ -132,11 +145,20 @@ Once created, the target is checked automatically on its own configured
 bounded by `WORKER_COUNT` (default 10) and `QUEUE_SIZE` (default 100),
 both configurable via environment variables.
 
-Press `Ctrl+C` to stop it — shutdown is graceful. Data is in-memory only
-and is lost on restart (durable storage arrives in M6).
+Press `Ctrl+C` to stop it — shutdown is graceful. Data is durably
+persisted in PostgreSQL — restart the process and it's still there.
 
-A `Dockerfile` is also provided: `docker build -t api-monitor .` (not yet
-verified in this environment — see `CLAUDE.md`).
+Or run the full stack (api-monitor + PostgreSQL) with Docker Compose —
+see `docs/development.md`:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+(The `docker compose`/`docker build` commands were reviewed carefully but
+not executed in this environment — no Docker daemon available; see
+`CLAUDE.md`.)
 
 ## Project philosophy
 
