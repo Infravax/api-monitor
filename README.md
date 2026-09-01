@@ -3,9 +3,10 @@
 Continuous HTTP/HTTPS API monitoring — reachability, latency, status
 correctness, uptime, and incident detection.
 
-**Status: under active development (Milestone 2). Target management has a
-working REST API; actual API monitoring (checks, scheduling, incidents,
-alerts) is not implemented yet.**
+**Status: under active development (Milestone 5). The application now
+performs real, periodic, concurrency-bounded HTTP checks against
+registered targets; incident detection, alerting, and durable persistence
+are not implemented yet.**
 
 ## Problem statement
 
@@ -32,14 +33,17 @@ None of this is implemented yet — see [Current status](#current-status).
 ## Current status
 
 The domain model (`Target`, `CheckResult`, `Incident`) is implemented
-(M1), and target management now has a working REST API backed by
-in-memory storage (M2): create, list, get, update, and delete targets over
-HTTP, plus a `/health` liveness endpoint. See
-[docs/api.md](docs/api.md) for the full API reference.
+(M1). Target management has a working REST API backed by in-memory
+storage (M2): create, list, get, update, and delete targets over HTTP,
+plus a `/health` liveness endpoint — see [docs/api.md](docs/api.md).
 
-No HTTP checking, scheduling, incident detection, alerting, or durable
-persistence exists yet — the server accepts target configuration but does
-not act on it.
+The application now actually monitors what you register: a scheduler
+(M4) periodically triggers a real HTTP/HTTPS check (M3) for every enabled
+target on its own configured interval, and a bounded worker pool (M5)
+caps how many checks run concurrently so registering many targets can't
+exhaust goroutines or connections. Results aren't persisted or
+interpreted yet — no incident detection, alerting, or durable storage
+exists — a check's outcome currently only reaches an internal log line.
 
 ## High-level architecture
 
@@ -91,10 +95,10 @@ and eventual distributed scaling.
 |---|---|
 | M0 | Foundation & architecture *(done)* |
 | M1 | Domain model *(done)* |
-| M2 | Target management + REST backend + Docker foundation *(current)* |
-| M3 | HTTP checker |
-| M4 | Scheduler |
-| M5 | Concurrent workers |
+| M2 | Target management + REST backend + Docker foundation *(done)* |
+| M3 | HTTP checker *(done)* |
+| M4 | Scheduler *(done)* |
+| M5 | Worker pool + concurrent check execution *(current)* |
 | M6 | Persistence (PostgreSQL) + Docker Compose |
 | M7 | Health & incident engine |
 | M8 | Alerting |
@@ -122,6 +126,11 @@ curl -X POST http://localhost:8080/api/v1/targets \
 
 curl http://localhost:8080/api/v1/targets
 ```
+
+Once created, the target is checked automatically on its own configured
+`interval` — watch the logs for `"check completed"` lines. Concurrency is
+bounded by `WORKER_COUNT` (default 10) and `QUEUE_SIZE` (default 100),
+both configurable via environment variables.
 
 Press `Ctrl+C` to stop it — shutdown is graceful. Data is in-memory only
 and is lost on restart (durable storage arrives in M6).

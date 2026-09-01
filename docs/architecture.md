@@ -1,16 +1,16 @@
 # Architecture
 
-> Status: Milestone 4 — the Scheduler (`scheduler.Scheduler`) is now
-> implemented and, for the first time, **wired into the running
-> application** (`cmd/api-monitor/main.go`): it periodically re-lists
-> targets from `target.Service`, and for each enabled one, triggers
-> `checker.Checker.Check` on that target's own configured interval. No
-> worker pool bounds concurrent execution yet (M5), nothing persists
-> results (M6), and nothing interprets them (M7/M8) — a produced
+> Status: Milestone 5 — check execution is now bounded. A worker pool
+> (`worker.Pool`) sits between the Scheduler and the Checker: the
+> Scheduler still decides *when* a target is due, but the actual HTTP
+> check now runs on one of a fixed number of pool workers instead of
+> directly in the Scheduler's own per-target goroutine, capping total
+> concurrent checks regardless of how many targets exist. Nothing
+> persists results (M6), and nothing interprets them (M7/M8) — a produced
 > `CheckResult` currently only reaches an optional callback, which the
 > application leaves unset today. See
-> [The Scheduler (Milestone 4)](#the-scheduler-milestone-4) below for what's
-> actually implemented vs. the target design in
+> [The Worker Pool (Milestone 5)](#the-worker-pool-milestone-5) below for
+> what's actually implemented vs. the target design in
 > [Core components](#core-components).
 
 ## System overview
@@ -308,8 +308,9 @@ come.
               target due (per-target ticker)
                          │
                          ▼
-               checker.Checker.Check(ctx, target)
-                         │
+               worker.Pool.Check(ctx, target)  (M5 — see below;
+                         │                      was checker.Checker.Check
+                         │                      directly through M4)
                          ▼
                     CheckResult
                          │
@@ -319,12 +320,15 @@ come.
 
 `scheduler.Scheduler` (`internal/scheduler/scheduler.go`) answers one
 question — *"when is each enabled target due for its next check?"* — and
-triggers the M3 Checker when the answer is "now." It does not perform HTTP
-requests itself, does not interpret a `CheckResult` beyond logging its
-`Outcome`/latency, and does not touch storage internals directly. This is
-the first milestone where the request-facing side of the application
-(Target Management's REST API, M2) and the monitoring side (Checker, M3)
-are connected — through the Scheduler, not through each other.
+triggers a check when the answer is "now," via whatever `TargetChecker` it
+was configured with. It does not perform HTTP requests itself, does not
+interpret a `CheckResult` at all (as of M5 it doesn't even log one — see
+[The Worker Pool](#the-worker-pool-milestone-5) below for why), and does
+not touch storage internals directly. This is the milestone where the
+request-facing side of the application (Target Management's REST API, M2)
+and the monitoring side (Checker, M3) were first connected — through the
+Scheduler, not through each other. That connection point is unchanged in
+M5; only what sits *behind* `TargetChecker` changed.
 
 **This is the first milestone where something in the running application
 actually calls the Checker.** `cmd/api-monitor/main.go` constructs a
@@ -381,11 +385,12 @@ for the full reasoning):
   behavior, not an assumption. So a check that outlives its own interval
   simply coalesces the ticks that arrive while it's running, rather than
   stacking up concurrent HTTP requests against the same slow/stuck target.
-  Chosen over allowing overlap because unbounded overlap against a
-  consistently-slow target would let goroutines and connections for that
-  one target grow without bound — the safer default for a single-process
-  scheduler. M5's worker pool may replace this with an explicit bounded
-  queue once concurrency is governed by pool size instead.
+  **This invariant is unchanged and still holds in M5** even though
+  execution moved to a pool worker: `TargetChecker.Check` still blocks the
+  per-target goroutine until a result is available (see
+  [The Worker Pool](#the-worker-pool-milestone-5)), so the same
+  ticker-coalescing behavior still guarantees at most one outstanding
+  check per target — the Scheduler didn't need to change to preserve it.
 - **New/changed targets are checked immediately**, not after waiting a
   full `Interval` — a target just created or edited through the REST API
   gets a prompt first observation rather than waiting up to `Interval`
@@ -403,19 +408,141 @@ for the full reasoning):
   `CheckResult` currently has out of the Scheduler. `main.go` leaves it
   unset today — there is no real consumer yet (M6 persistence, M7/M8
   interpretation), and building a placeholder sink would be exactly the
-  kind of "pretend it works" code this project avoids. It is called
-  synchronously in the per-target goroutine, so a slow `OnResult` would
-  delay that target's own next tick; that's an acceptable, documented
-  limitation while the only concern is a fast in-process callback, and
-  precisely the seam M5's worker pool is expected to replace with
-  something that decouples check execution from result consumption.
+  kind of "pretend it works" code this project avoids. It is still called
+  synchronously in the per-target goroutine in M5 (unchanged from M4), so
+  a slow `OnResult` would still delay that target's own next tick.
+- **The Scheduler no longer logs check results (changed in M5).** Through
+  M4 it logged `Outcome`/`status_code`/`latency` itself; that line was
+  removed because it duplicated the Worker Pool's own "check completed"
+  log line one-for-one, and the Pool's version carries more information
+  (queue wait time) than the Scheduler has visibility into. The
+  Scheduler's own logging is scoped to scheduling events now (target
+  scheduled/unscheduled); execution-result logging belongs to whichever
+  `TargetChecker` actually ran the check.
 - **URLs are not logged.** Scheduler log lines include target ID and name,
   never `Target.URL` — a URL can legally carry embedded userinfo
   credentials (`https://user:pass@host/...`), and nothing in the domain
   model forbids that today.
 
-Not built in M4, on purpose: PostgreSQL, Kafka, Redis, a worker pool, or
-any bound on total concurrent checks across all targets (today, N enabled
-targets means up to N concurrently-running per-target goroutines with no
-shared limit — acceptable at the scale this milestone targets, and exactly
-the gap M5's worker pool exists to close).
+Not built by the Scheduler itself, on purpose: PostgreSQL, Kafka, Redis,
+or any check execution logic — bounding total concurrent checks across all
+targets was the one gap M4 explicitly left open (up through M4, N enabled
+targets meant up to N concurrently-running per-target goroutines with no
+shared limit), and closing it is exactly what M5's Worker Pool does, below
+— without changing a single line of this package.
+
+## The Worker Pool (Milestone 5)
+
+```
+                       Targets
+                          │
+                          ▼
+                     Scheduler
+                          │
+                     target due
+                          │
+                          ▼
+                  ┌────────────────┐
+                  │   Work Queue    │   bounded: QueueSize slots
+                  │ (buffered chan) │   (default 100)
+                  └────────┬────────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+          Worker 1      Worker 2  ...  Worker N   N = WorkerCount
+              │             │             │        (default 10)
+              └─────────────┼─────────────┘
+                            ▼
+                    checker.Checker
+                            │
+                            ▼
+                       CheckResult
+                            │
+                            ▼
+              (delivered back to the calling
+               per-target goroutine in Scheduler)
+```
+
+`worker.Pool` (`internal/worker/pool.go`) answers *"how many checks may
+run at the same time?"* — a question the Scheduler answered implicitly
+(and unboundedly) through M4. It does not decide when a target is due
+(Scheduler), does not know how an HTTP check is performed (`checker`), and
+does not interpret a result (future Incident Engine, M7).
+
+**The Scheduler required zero code changes for M5.** `worker.Pool`
+implements `Check(ctx context.Context, t target.Target) checker.CheckResult`
+— exactly `scheduler.TargetChecker`'s signature, the same interface the
+Scheduler has depended on since M4. `main.go` is the only thing that
+changed: it now constructs a `*worker.Pool` (wrapping a real
+`*checker.Checker`) and hands *that* to `scheduler.Config.Checker` instead
+of the bare Checker. This is the M4 interface decision paying off exactly
+as intended — a swappable implementation, not a rewrite.
+
+Key design points (see `internal/worker/pool.go`'s doc comments for the
+full reasoning):
+
+- **Bounded queue (`chan job`, capacity `QueueSize`), not unlimited.** An
+  unbounded queue would just relocate the original problem — unbounded
+  goroutines — into unbounded queued memory instead of solving it.
+- **`WorkerCount` defaults to 10, deliberately not `runtime.NumCPU()`.**
+  This is an I/O-bound workload (waiting on network round-trips to
+  third-party APIs), not CPU-bound computation, so tying concurrency to
+  core count would be arbitrary and likely too low. 10 is a conservative
+  starting point specifically because these requests target APIs InfraVex
+  doesn't own — a fresh deployment shouldn't hammer someone else's API by
+  default. Both `WorkerCount` (`WORKER_COUNT`) and `QueueSize`
+  (`QUEUE_SIZE`, default 100) are environment-configurable
+  (`internal/config`), with the same silent-fallback-to-default
+  philosophy as the rest of the config system for invalid values.
+- **Backpressure policy: block the submitting goroutine, not drop or
+  coalesce the job.** When the queue is full, `Submit` blocks until room
+  frees up (or `ctx` is canceled). This is deliberately safe *because* of
+  the next point — per-target submission is already capped at one
+  outstanding job, so the number of goroutines that could ever be blocked
+  in `Submit` is bounded by the number of targets, never unbounded.
+  Dropping was rejected because it creates gaps in monitoring history
+  exactly when the system is under load — precisely when observability
+  matters most. A future durable queue (Kafka, M9) could absorb bursts
+  without an in-process blocking caller at all; nothing in M5 needs that
+  yet.
+- **Duplicate-job policy: at most one outstanding job per target,
+  preserved from M4 — not multiple jobs queued for the same target.**
+  `Pool.Check` blocks its caller until a result arrives, so the
+  Scheduler's per-target goroutine (and its M4 ticker-coalescing
+  behavior) never proceeds to a second submission for the same target
+  while the first is still queued or executing. This is also what
+  provides fairness between targets "for free": since no target can ever
+  occupy more than one queue/worker slot at a time, a high-frequency
+  target can't starve a low-frequency one out of proportion to its own
+  interval — no priority scheduler was needed.
+- **Panic isolation.** `Checker.Check` runs inside a `recover()`. A
+  recovered panic is logged loudly (panic value + stack trace) at Error —
+  never hidden as a normal check failure — but is reported to the waiting
+  caller as an ordinary `CheckResult` (`OutcomeConnectionError`, reusing
+  an existing Outcome rather than adding a new domain concept for what
+  should be an unreachable safety net) so the worker goroutine survives
+  and keeps processing subsequent jobs. A failed *check* (timeout, 500,
+  connection refused) was never a threat to the worker in the first place
+  — it's normal data, not an error path.
+- **Shutdown: bounded, not a full drain.** Once `ctx` is canceled, workers
+  stop pulling *new* jobs; a job already executing is allowed to finish
+  (which resolves quickly on its own, since `checker.Checker` aborts an
+  in-flight HTTP request promptly on cancellation). Jobs still sitting in
+  the queue are abandoned, not drained to completion — draining a
+  potentially-deep queue could make shutdown take as long as the queue is
+  deep, risking the same "must not hang" failure this project has avoided
+  since M2. A dropped-on-shutdown check is simply attempted again on the
+  target's next scheduled interval after restart.
+- **Context propagation unchanged from M3/M4.** The Pool passes the same
+  `ctx` straight through to `checker.Checker.Check`, adding no extra
+  wrapping layer — each check's own bounded timeout is still entirely
+  `target.Timeout`'s job (M3), not something the Pool re-implements.
+
+Identified but deliberately not built in M5 (documented here so M10 has a
+starting list, not implemented now): `checks_started`, `checks_completed`,
+`checks_failed`, `queue_depth`, `queue_drops`, `worker_busy`,
+`check_duration` as real metrics (Prometheus or otherwise) — M5 only logs
+discrete events (`worker pool started/stopped`, `worker started/stopped`,
+`check completed`, and a `Warn` when a submission has to wait for queue
+capacity), which is enough for now but not a substitute for actual
+observability tooling.
