@@ -1,10 +1,10 @@
-// Package scheduler will decide when each target's next check is due and
-// trigger the checker accordingly, based on each target's configured
-// interval.
+// Package scheduler decides when each enabled target's next check is due
+// and triggers it, based on that target's configured interval.
 //
-// It owns timing only. It does not perform HTTP requests itself and does
-// not interpret results — that belongs to checker and the result
-// processing/incident logic.
-//
-// Not yet implemented (Milestone 0 is documentation-only for this package).
+// It owns timing only: it does not perform HTTP requests itself (that's
+// checker.Checker, consumed here through the small TargetChecker
+// interface), and it does not interpret results — a CheckResult is simply
+// handed to an optional callback, never inspected. What a result *means*
+// (UP/DOWN, incidents, alerts) is decided elsewhere, in milestones not yet
+// built.
 package scheduler

@@ -10,7 +10,7 @@ the project in a state that builds, runs, and can be verified.
 | M1 | Domain Model | `Target`, `CheckResult`, `Incident`, and related domain concepts. *(done)* |
 | M2 | Target Management + REST Backend + Docker Foundation | CRUD REST API for targets (handler/service/repository), in-memory storage, HTTP server with graceful shutdown, config, middleware, Dockerfile. *(done)* |
 | M3 | HTTP Checker | Perform one real HTTP/HTTPS check against a `Target`, measure latency, classify timeout/connection/status outcomes. *(done)* |
-| M4 | Scheduler | Periodically schedule monitoring checks. |
+| M4 | Scheduler | Periodically trigger the M3 Checker for each enabled target on its own configured interval; wire it into the running application. *(done)* |
 | M5 | Concurrent Workers | Introduce safe concurrency and worker management. |
 | M6 | Persistence | PostgreSQL, schema design, migrations, repositories (replacing the M2 in-memory one), Docker Compose. |
 | M7 | Health & Incident Engine | UP/DOWN state transitions, failure thresholds and recovery. |
@@ -27,21 +27,22 @@ server they depend on.
 
 ## Current status
 
-Milestone 3 is complete: `checker.Checker` (`internal/checker/check.go`)
-performs one real HTTP/HTTPS request against a `target.Target` and
-returns a `checker.CheckResult`, correctly classifying success,
-unexpected status, timeout, connection failure, and caller-initiated
-cancellation (`OutcomeCanceled`, added this milestone). It is
-concurrency-safe (verified with `go test -race`) and fully covered by
-`httptest`-based tests — no external network dependency.
+Milestone 4 is complete: `scheduler.Scheduler`
+(`internal/scheduler/scheduler.go`) periodically re-lists targets and, for
+each enabled one, triggers `checker.Checker.Check` on its own configured
+`Interval` — checks never overlap for a single target, new/changed
+targets are checked immediately, and disabled/deleted targets stop being
+scheduled within one `DiscoveryInterval`. **This is the first milestone
+where the application actually runs real HTTP checks**:
+`cmd/api-monitor/main.go` now starts the Scheduler alongside the HTTP
+server, sharing the same shutdown context.
 
-**The Checker is not yet invoked by anything in the running
-application.** Nothing schedules it periodically (M4), runs it under a
-worker pool (M5), persists its output (M6), or reacts to it (M7/M8). It
-exists today only as a tested, callable package.
+`CheckResult`s are not yet persisted (M6) or interpreted (M7/M8) — they
+currently only reach an optional, unset-by-default `OnResult` callback and
+the Scheduler's own lifecycle log line.
 
-M2's target management REST API remains as previously described:
-`POST/GET/PUT/DELETE /api/v1/targets` and `GET /health`, backed by
+M2's target management REST API and M3's Checker are unchanged:
+`POST/GET/PUT/DELETE /api/v1/targets` and `GET /health` remain backed by
 `target.Service` → `target.Repository` → `storage.MemoryTargetRepository`
-(concurrency-safe, in-memory), with request-ID/logging/recovery
-middleware, configurable timeouts, graceful shutdown, and a `Dockerfile`.
+(concurrency-safe, in-memory); `checker.Checker` remains a concrete,
+stateless, concurrency-safe HTTP/HTTPS checker.

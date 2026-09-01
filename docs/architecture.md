@@ -1,14 +1,16 @@
 # Architecture
 
-> Status: Milestone 3 — the HTTP Checker (`checker.Checker`) is now
-> implemented: given a `target.Target`, it performs one real HTTP/HTTPS
-> request and returns a `checker.CheckResult`. It is a standalone,
-> fully-tested package-level component — nothing in the running
-> application calls it yet. No scheduler exists to invoke it periodically
-> (M4), no worker pool runs it concurrently at scale (M5), and nothing
-> persists its results (M6) or reacts to them (M7/M8). See
-> [The HTTP Checker (Milestone 3)](#the-http-checker-milestone-3) below for
-> what's actually implemented vs. the target design in
+> Status: Milestone 4 — the Scheduler (`scheduler.Scheduler`) is now
+> implemented and, for the first time, **wired into the running
+> application** (`cmd/api-monitor/main.go`): it periodically re-lists
+> targets from `target.Service`, and for each enabled one, triggers
+> `checker.Checker.Check` on that target's own configured interval. No
+> worker pool bounds concurrent execution yet (M5), nothing persists
+> results (M6), and nothing interprets them (M7/M8) — a produced
+> `CheckResult` currently only reaches an optional callback, which the
+> application leaves unset today. See
+> [The Scheduler (Milestone 4)](#the-scheduler-milestone-4) below for what's
+> actually implemented vs. the target design in
 > [Core components](#core-components).
 
 ## System overview
@@ -191,12 +193,13 @@ Management + Storage), not the full future system:
         MemoryTargetRepository (internal/storage) — in-memory only
 ```
 
-Scheduler, Result Processor, Incident Manager, and Alert Manager from the
+Result Processor, Incident Manager, and Alert Manager from the
 [Core components](#core-components) table above are **not** wired into
-this flow yet — they remain future components. The Checker exists as of
-M3 (see below) but is not called from this HTTP request path at all; it is
-invoked directly by its own tests today, with nothing yet triggering it
-periodically. So does durable storage: `MemoryTargetRepository` is a
+this flow yet — they remain future components. The Scheduler and Checker
+exist as of M4/M3 (see below), but neither is part of this HTTP request
+path at all — the Scheduler runs as its own independent loop, started
+alongside the HTTP server in `main.go`, not triggered by any REST request.
+Durable storage doesn't exist yet either: `MemoryTargetRepository` is a
 `map[string]Target` behind a mutex;
 data is lost on restart. It exists to unblock the REST API before
 PostgreSQL arrives (M6), implementing `target.Repository` — an interface
@@ -280,8 +283,9 @@ full reasoning):
   the content — M3 does not validate response bodies.
 - **No persistence, scheduling, or logging inside the Checker.** It
   returns a value; what happens to that value (stored, scheduled again,
-  logged, alerted on) is entirely the caller's decision, once a caller
-  exists.
+  logged, alerted on) is entirely the caller's decision. As of M4, that
+  caller is the Scheduler (below) — the Checker package itself is
+  unchanged by that; it still doesn't know the Scheduler exists.
 
 This does not change the [Future scaling direction](#future-scaling-direction)
 section above — `Checker.Check` was written statelessly and safely for
@@ -289,3 +293,129 @@ concurrent use specifically so that M5's worker pool can call it from many
 goroutines without modification. That is a property that already holds
 today (verified with `go test -race`), not a promise about work still to
 come.
+
+## The Scheduler (Milestone 4)
+
+```
+                  target.Repository
+                         │
+                         ▼
+                    target.Service
+                         │
+                         ▼ (re-listed every DiscoveryInterval)
+                     Scheduler
+                         │
+              target due (per-target ticker)
+                         │
+                         ▼
+               checker.Checker.Check(ctx, target)
+                         │
+                         ▼
+                    CheckResult
+                         │
+                         ▼
+        OnResult callback (unset today — see below)
+```
+
+`scheduler.Scheduler` (`internal/scheduler/scheduler.go`) answers one
+question — *"when is each enabled target due for its next check?"* — and
+triggers the M3 Checker when the answer is "now." It does not perform HTTP
+requests itself, does not interpret a `CheckResult` beyond logging its
+`Outcome`/latency, and does not touch storage internals directly. This is
+the first milestone where the request-facing side of the application
+(Target Management's REST API, M2) and the monitoring side (Checker, M3)
+are connected — through the Scheduler, not through each other.
+
+**This is the first milestone where something in the running application
+actually calls the Checker.** `cmd/api-monitor/main.go` constructs a
+`scheduler.Scheduler` and starts it (`go sched.Start(ctx)`) alongside the
+HTTP server, sharing the same top-level context from `signal.NotifyContext`
+— one SIGTERM/SIGINT stops both.
+
+Key design points (see `internal/scheduler/scheduler.go`'s doc comments
+for the full reasoning):
+
+- **Two consumer-defined interfaces, not a dependency on concrete types.**
+  `TargetLister` (`List(ctx) ([]target.Target, error)`) and
+  `TargetChecker` (`Check(ctx, target.Target) checker.CheckResult`) are
+  defined in `internal/scheduler` itself — the same "interface owned by
+  the consumer, not the implementer" pattern `target.Repository`
+  established in M2. `*target.Service` and `*checker.Checker` already
+  satisfy them with zero changes. This does not reverse M3's decision to
+  keep `checker.Checker` a concrete type with no interface of its own
+  (that was about the Checker having only one implementation); it's a
+  different, later decision by a different consumer, justified by a
+  concrete current need: scheduler tests that verify *timing* behavior
+  without every test needing a real HTTP round-trip.
+- **Polling-based target discovery, not a push/event mechanism.** The
+  Scheduler re-lists all targets from `TargetLister` every
+  `DiscoveryInterval` (default 10s) and reconciles the set of running
+  per-target goroutines against what it finds — starting new ones,
+  restarting changed ones, stopping disabled or deleted ones. This is what
+  makes target create/update/enable-disable/delete "just work" without
+  bespoke handling for each case, at the cost of an explicit, bounded
+  staleness window (up to `DiscoveryInterval`) between a change made
+  through the REST API and the Scheduler noticing it. A push mechanism
+  (e.g. `target.Service` notifying the Scheduler directly) would remove
+  that window but adds real coupling/complexity nothing in M4 justifies
+  yet.
+- **One goroutine per enabled target**, each running its own
+  `time.Ticker` at that target's own `Interval` — not a central loop or a
+  timer/priority queue. Simplest design that still gives every target its
+  own independent, correctly-spaced schedule; a priority queue solves a
+  scaling problem (many thousands of targets in one process) this
+  milestone doesn't have, and which M12 (distributed scaling), not M4, is
+  where that would be revisited if it ever becomes real.
+- **Fixed schedule, not completion-based.** Checks happen at
+  `t.Interval`, `2*t.Interval`, ... regardless of how long any individual
+  check took — not "wait `Interval` after the previous check finishes."
+  Completion-based scheduling would let a target's own latency silently
+  reduce how often it gets checked, which is backwards for a monitoring
+  system: a struggling target is exactly the one that should keep being
+  observed on a predictable cadence, not less often.
+- **Checks never overlap for a single target ("skip if still running"),
+  not allowed to run concurrently.** Not implemented with an explicit
+  busy-flag: `runCheck` is called synchronously in the same goroutine that
+  receives from `ticker.C`, and `time.Ticker`'s channel has a buffer of
+  exactly one and drops ticks it can't deliver — documented stdlib
+  behavior, not an assumption. So a check that outlives its own interval
+  simply coalesces the ticks that arrive while it's running, rather than
+  stacking up concurrent HTTP requests against the same slow/stuck target.
+  Chosen over allowing overlap because unbounded overlap against a
+  consistently-slow target would let goroutines and connections for that
+  one target grow without bound — the safer default for a single-process
+  scheduler. M5's worker pool may replace this with an explicit bounded
+  queue once concurrency is governed by pool size instead.
+- **New/changed targets are checked immediately**, not after waiting a
+  full `Interval` — a target just created or edited through the REST API
+  gets a prompt first observation rather than waiting up to `Interval`
+  (which could be minutes).
+- **Shutdown propagates into in-flight checks.** A per-target goroutine's
+  context is derived from the Scheduler's own `ctx`, which the Checker's
+  own per-request context (M3) is in turn derived from — so when the
+  Scheduler shuts down mid-check, that check's HTTP request is canceled
+  too, and the M3 Checker reports it as `OutcomeCanceled` promptly rather
+  than the shutdown hanging on an in-flight request. `Start` returns only
+  once every per-target goroutine it started has actually exited
+  (`sync.WaitGroup`), so no goroutines outlive a completed shutdown.
+- **Result handling: an optional callback, not a fake persistence
+  layer.** `Config.OnResult func(checker.CheckResult)` is the only path a
+  `CheckResult` currently has out of the Scheduler. `main.go` leaves it
+  unset today — there is no real consumer yet (M6 persistence, M7/M8
+  interpretation), and building a placeholder sink would be exactly the
+  kind of "pretend it works" code this project avoids. It is called
+  synchronously in the per-target goroutine, so a slow `OnResult` would
+  delay that target's own next tick; that's an acceptable, documented
+  limitation while the only concern is a fast in-process callback, and
+  precisely the seam M5's worker pool is expected to replace with
+  something that decouples check execution from result consumption.
+- **URLs are not logged.** Scheduler log lines include target ID and name,
+  never `Target.URL` — a URL can legally carry embedded userinfo
+  credentials (`https://user:pass@host/...`), and nothing in the domain
+  model forbids that today.
+
+Not built in M4, on purpose: PostgreSQL, Kafka, Redis, a worker pool, or
+any bound on total concurrent checks across all targets (today, N enabled
+targets means up to N concurrently-running per-target goroutines with no
+shared limit — acceptable at the scale this milestone targets, and exactly
+the gap M5's worker pool exists to close).
