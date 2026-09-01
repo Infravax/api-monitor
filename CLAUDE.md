@@ -11,178 +11,186 @@ Project: InfraVex API Monitor
 Organization: InfraVex
 Language: Go
 Module: github.com/InfraVex/api-monitor
-Current Milestone: M1 (complete)
+Current Milestone: M2 (complete)
 ```
 
 ## Current Architecture
 
 Modular monolith. One binary (`cmd/api-monitor`), internal packages each
-owning one responsibility (`target`, `checker`, `scheduler`, `incident`,
-`alert`, `storage`, `api`). Full design in `docs/architecture.md`. As of
-M1, only the domain types inside `target`, `checker`, and `incident` are
-implemented — everything else is still an empty, documented package
-(`doc.go` only).
+owning one responsibility. Full design in `docs/architecture.md` (see its
+"Request architecture (Milestone 2)" section for what's actually wired up
+today vs. the target design).
 
-## Completed Work
+As of M2, a real HTTP path exists end to end:
+`net/http server → RequestID/Logging/Recovery middleware → TargetHandler →
+target.Service → Target.Validate → target.Repository →
+storage.MemoryTargetRepository`. `checker`, `scheduler`, `incident`,
+`alert` remain doc-only (M1's domain types in `checker`/`incident` are
+implemented, but nothing consumes them yet).
 
-**M0** — Repo scaffolding, Go module init, `internal/` package skeletons
-(doc-comment only), `cmd/api-monitor/main.go` (starts, logs, graceful
-shutdown on SIGINT/SIGTERM, no business logic), `docs/architecture.md`,
-`docs/development.md`, `docs/roadmap.md`, `README.md`, `LICENSE`,
-`.gitignore`.
+## Completed Milestones
 
-**M1** — Renamed the project from `InfraCex` to `InfraVex` throughout
-(module path, `main.go`, `README.md`, `docs/architecture.md`, `LICENSE`).
-Implemented the domain model:
-- `internal/id` — shared UUIDv4 ID generator (`id.New() string`), stdlib
-  `crypto/rand` only.
-- `internal/target` — `Target` type + `New`/`Validate`.
-- `internal/checker` — `CheckResult` type + `Outcome` enum +
-  `New`/`Validate`/`Success`.
-- `internal/incident` — `Incident` type + `New`/`Validate`/`Resolve`/
-  `IsOpen`/`IsResolved`/`Duration`.
-
-All three domain packages have unit tests covering valid construction,
-each documented invariant, and (for `incident`) the `Resolve` transition.
+```
+M0 — Foundation & Architecture
+M1 — Domain Model
+M2 — Target Management + REST Backend + Docker Foundation
+```
 
 ## Domain Model
 
-### Target (`internal/target`)
-```go
-type Target struct {
-    ID, Name, URL, Method string
-    Interval, Timeout     time.Duration
-    ExpectedStatusCode    int
-    Enabled                bool
-}
-```
-- `target.New(target.NewParams{...})` — defaults `Method` to `GET` and
-  `ExpectedStatusCode` to `200` if left zero-valued; `Interval`/`Timeout`
-  have **no default** (must be set explicitly — silently defaulting a
-  check interval was judged too risky).
-- Invariants (see `ErrXxx` sentinels in `target.go`): non-empty
-  ID/Name/URL/Method; URL must parse with a non-empty host
-  (`ErrInvalidURL`) and scheme `http`/`https` (`ErrUnsupportedScheme`);
-  Method must be one of GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS; Interval
-  and Timeout must be `> 0`; ExpectedStatusCode must be 100–599.
-- No `CreatedAt`/`UpdatedAt` yet — nothing sets them until persistence
-  (M6) or Target Management (M2) exists; adding them now would be dead
-  fields.
+Unchanged from M1 — see `docs/architecture.md`'s "Domain model (Milestone
+1)" section for full detail. Summary:
 
-### CheckResult (`internal/checker`)
-```go
-type CheckResult struct {
-    ID, TargetID, ErrorMessage string
-    Timestamp                  time.Time
-    Outcome                    Outcome
-    StatusCode                 int
-    Latency                    time.Duration
-}
-```
-- `Outcome` is one of `success`, `unexpected_status`, `timeout`,
-  `connection_error`. **`Success` is not a stored field** — `Success()` is
-  derived from `Outcome` so the type cannot represent a contradictory
-  state (e.g. "success" with an error message).
-- `StatusCode == 0` means "no HTTP response" (sentinel, since 0 is never a
-  real status code) — required non-zero (100–599) for `success`/
-  `unexpected_status`, must be 0 for `timeout`/`connection_error`.
-- `ErrorMessage` required non-empty for `timeout`/`connection_error`, must
-  be empty for `success`.
-- `checker.New(checker.NewParams{...})` normalizes `Timestamp` to UTC.
+- **`Target`** (`internal/target`) — endpoint + check policy
+  (name/URL/method/interval/timeout/expected status/enabled). Validated by
+  `Target.Validate()`; constructed via `target.New(NewParams)`.
+- **`CheckResult`** (`internal/checker`) — outcome of one check attempt,
+  via a stored `Outcome` enum, not a raw `Success` bool.
+- **`Incident`** (`internal/incident`) — open/resolved period, derived
+  from `ResolvedAt == nil`, not a separate status field.
 
-### Incident (`internal/incident`)
-```go
-type Incident struct {
-    ID, TargetID, Reason string
-    StartedAt            time.Time
-    ResolvedAt            *time.Time // nil = open
-}
-```
-- No `Status` field — open/resolved is derived solely from whether
-  `ResolvedAt` is nil (`IsOpen()`/`IsResolved()`), to avoid a second field
-  that could drift out of sync.
-- `incident.New(...)` opens an incident (`ResolvedAt` nil). `Resolve(t)` is
-  the only way to close one; it errors on double-resolve
-  (`ErrAlreadyResolved`) or `t` before `StartedAt`
-  (`ErrResolvedBeforeStarted`). **Reopening is not supported** — a
-  recurrence after resolution is a new `Incident`, by design.
-- The failure-threshold/state-transition *engine* (deciding *when* N
-  consecutive failures should open/resolve an incident) is explicitly
-  deferred to M7. This type only owns the shape and the single
-  open→resolved transition.
-- `Duration(now time.Time) time.Duration` is derived, not stored.
+## M2 Implementation
+
+- **HTTP server** (`internal/api/server.go`) — `net/http.Server` only, no
+  framework. Configurable `Addr`/`ReadTimeout`/`WriteTimeout`/`IdleTimeout`.
+- **Router** (`internal/api/router.go`) — Go 1.22+ `http.ServeMux` with
+  method + `{id}` path-parameter patterns; no third-party router needed.
+- **Routes**:
+  - `GET /health` — liveness only (see `docs/api.md`)
+  - `POST /api/v1/targets`, `GET /api/v1/targets`,
+    `GET /api/v1/targets/{id}`, `PUT /api/v1/targets/{id}`,
+    `DELETE /api/v1/targets/{id}`
+- **Handler** (`internal/api/target_handler.go`) — parses/validates at the
+  transport boundary (JSON decode, duration parsing, 1 MiB body cap via
+  `http.MaxBytesReader`), maps domain errors to HTTP status/JSON via
+  `writeServiceError`, contains no business logic.
+- **DTOs** (`internal/api/target_dto.go`) — `targetRequest`/
+  `targetResponse`, separate from `target.Target` for two concrete
+  reasons: (1) `time.Duration` has no built-in human-friendly JSON
+  encoding (`"30s"` on the wire vs. int64 nanoseconds internally), and (2)
+  it decouples the wire contract from the domain type's shape.
+- **Service** (`internal/target/service.go`) — `Service.{Create,Get,List,
+  Update,Delete}`, knows nothing about HTTP. `Update` fetches the existing
+  target, rebuilds it with `Target.Validate()` (not `New`, so the ID is
+  preserved), then persists.
+- **Repository interface** (`internal/target/repository.go`) —
+  `Repository` defined in `internal/target` (the consumer/owner of
+  `Target`), not in `internal/storage`. `ErrNotFound`/`ErrAlreadyExists`
+  sentinels.
+- **In-memory storage** (`internal/storage/memory_target_repository.go`) —
+  `MemoryTargetRepository`, `map[string]target.Target` behind a
+  `sync.RWMutex`. `List` sorts by Name then ID for deterministic output
+  (the domain model has no creation timestamp to sort by). Concurrency
+  verified with `go test -race`.
+- **Configuration** (`internal/config/config.go`) — env vars with
+  defaults, no framework: `HTTP_ADDR` (`:8080`), `HTTP_READ_TIMEOUT`
+  (`5s`), `HTTP_WRITE_TIMEOUT` (`10s`), `HTTP_IDLE_TIMEOUT` (`60s`).
+  Unparsable values silently fall back to the default.
+- **Middleware** (`internal/api/middleware.go`) — `RequestID` (reuses
+  `internal/id` from M1, no separate UUID dependency) → `Logging`
+  (method/path/status/duration/request_id via `log/slog`) → `Recovery`
+  (panic → 500 JSON, doesn't crash the server). Order matters: `Logging`
+  wraps `Recovery` so a recovered panic still gets an accurate status
+  logged.
+- **`main.go`** — pure wiring: loads config, builds repository → service →
+  handler → server, runs `ListenAndServe` in a goroutine, waits on
+  `signal.NotifyContext` or a server error, then `Shutdown` with a 10s
+  timeout.
+- **Docker** (`Dockerfile`, `.dockerignore`) — multi-stage:
+  `golang:1.25-alpine` build stage, `alpine:3.20` runtime stage, non-root
+  user, `HEALTHCHECK` via `wget` against `/health`. No `docker-compose.yml`
+  — not justified yet (single service, nothing to orchestrate against
+  until PostgreSQL in M6).
 
 ## Important Decisions
 
-- **IDs**: plain `string`, UUIDv4 generated via `internal/id` (stdlib
-  `crypto/rand`, no `google/uuid` dependency). Domain objects generate
-  their own ID at construction time, so a `Target`/`CheckResult`/
-  `Incident` is always fully valid the instant it's built, without waiting
-  on a database. Considered a distinct `TargetID` named type for
-  compile-time safety on the `TargetID` fields in `checker`/`incident`,
-  but deferred — it would force those packages to import `target` for no
-  current benefit, since target/checker/incident have zero
-  interdependencies as of M1.
-- **No `internal/models` package**: domain types live with the package
-  most responsible for producing/owning them (`Target`→`target`,
-  `CheckResult`→`checker`, `Incident`→`incident`), matching
-  `docs/architecture.md`'s component table. `internal/id` is the one
-  shared package, but it's a leaf *utility* (no business meaning), not a
-  models dumping ground.
-- **`New...Params` structs instead of positional constructor args**: used
-  in all three `New` functions specifically because adjacent
-  same-typed parameters (`Interval`/`Timeout` both `time.Duration`;
-  `TargetID`/`Reason` both `string`) are easy to swap by accident at a
-  call site with positional args.
-- **Time**: `time.Time` / `time.Duration` throughout, no custom wrapper.
-  All timestamps normalized to UTC in constructors — this system is
-  designed to eventually run checks from multiple regions, so avoiding
-  timezone-dependent comparisons early matters.
-- **Errors**: each package exports sentinel `Err...` values so callers/
-  tests use `errors.Is` rather than string matching.
-- No repository/persistence interfaces created yet (`TargetRepository`
-  etc.) — no implementation or caller exists yet; those belong to M2/M6
-  when there's an actual reason for them.
+- **Standard library HTTP, no framework**: routing needs (method + one
+  path param) are fully covered by Go 1.22+'s `http.ServeMux`; a
+  framework would be a dependency with no problem left for it to solve.
+- **In-memory storage now, PostgreSQL postponed to M6**: `target.Repository`
+  is an interface, so this is a swap, not a rewrite, when M6 arrives —
+  same pattern validated by M1's prediction that `Validate()` (not just
+  `New()`) would be needed for exactly this kind of external
+  reconstruction, which `Service.Update` now actually uses.
+- **Kafka postponed**: nothing in the current architecture produces events
+  that need a broker; M9 (event-driven check results/incidents) is where
+  this becomes justified, per the roadmap re-ordering below.
+- **Still a modular monolith**: one binary, clean internal seams
+  (`Handler → Service → Repository`), no network hop between them. Not
+  revisited in M2.
+- **Roadmap re-ordering**: `docs/roadmap.md` moved the target REST API
+  and the first Docker image from their original M9/M11 slots into M2
+  itself, since M2 was the milestone that introduced the HTTP server they
+  depend on. M9 is now "Kafka / event-driven architecture" (check
+  results/incidents, building on M2's REST foundation rather than
+  duplicating it); M11 is production hardening beyond the M2 Docker
+  foundation. `docs/roadmap.md` documents this change and why.
+- **`UpdateParams` includes `Enabled`, `NewParams` does not**: a new
+  target always starts enabled (M1 decision, unchanged); an existing one
+  must be pause/resume-able via `PUT`, which is a create-vs-update
+  asymmetry, not an oversight.
+- **`Enabled *bool` in the request DTO**: distinguishes "omitted" (defaults
+  to `true`) from "explicitly `false`", for both create and update.
+- **1 MiB request body cap**: cheap, standard-library-only
+  (`http.MaxBytesReader`), and a real (if basic) protection against
+  oversized payloads now that the server accepts arbitrary client JSON.
 
 ## Dependencies
 
-None beyond the Go standard library. `go.mod` has no `require` block.
+None beyond the Go standard library. `go.mod` has no `require` block, no
+`go.sum` exists. (Same as M0/M1 — still true after M2.)
 
-## Validation
+## Verification
 
 Run from repo root:
 ```
-gofmt -w .        # ok, only reformatted target_test.go alignment
-go vet ./...      # ok
-go build ./...    # ok
-go test ./...     # ok — 27 subtests across internal/id, internal/target,
-                  #      internal/checker, internal/incident, all passing
+gofmt -w .            # ok, only reformatted whitespace
+go vet ./...           # ok
+go build ./...          # ok
+go test ./...            # ok — all packages pass
+go test -race ./...       # ok — no data races, including the concurrent
+                          #      MemoryTargetRepository stress test
 ```
-Binary manually verified to start (logs `infravex api-monitor starting
-milestone=M1`) and shut down cleanly on SIGTERM.
+Manually verified end-to-end: built the binary, ran it, and exercised the
+full CRUD flow with `curl` — `POST` create → `GET` by id → `GET` list →
+`PUT` update → `DELETE` → `GET` returns 404 → unknown id returns 404 — all
+correct status codes and JSON bodies. Confirmed graceful shutdown on
+SIGTERM.
+
+**Docker was not executed** — no Docker daemon was available in the
+environment this milestone was built in. The `Dockerfile` was written and
+reviewed carefully (multi-stage, non-root, meaningful `HEALTHCHECK`) but
+`docker build`/`docker run` have not actually been run. Verify locally
+before relying on it.
 
 ## Current Repository Structure
 
 ```
 api-monitor/
-├── cmd/api-monitor/main.go
+├── cmd/api-monitor/main.go              (wiring only)
 ├── internal/
-│   ├── target/       target.go, target_test.go, doc.go
-│   ├── checker/      check_result.go, check_result_test.go, doc.go
-│   ├── incident/     incident.go, incident_test.go, doc.go
-│   ├── id/           id.go, id_test.go        (shared ID utility)
-│   ├── scheduler/    doc.go only (not implemented)
-│   ├── alert/        doc.go only (not implemented)
-│   ├── storage/      doc.go only (not implemented)
-│   └── api/          doc.go only (not implemented)
-├── docs/architecture.md, development.md, roadmap.md
+│   ├── target/    target.go, repository.go, service.go, doc.go + tests
+│   ├── checker/   check_result.go, doc.go + tests            (M1, unused so far)
+│   ├── incident/  incident.go, doc.go + tests                (M1, unused so far)
+│   ├── id/        id.go                                      (shared UUID util)
+│   ├── config/    config.go + tests
+│   ├── storage/   memory_target_repository.go, doc.go + tests
+│   ├── api/       server.go, router.go, target_handler.go,
+│   │              health_handler.go, middleware.go, response.go,
+│   │              target_dto.go, doc.go + tests
+│   ├── scheduler/ doc.go only (not implemented)
+│   └── alert/     doc.go only (not implemented)
+├── docs/architecture.md, development.md, roadmap.md, api.md
+├── Dockerfile, .dockerignore
 ├── README.md, LICENSE, .gitignore, go.mod, CLAUDE.md
 ```
 
-## Future Work
+## Next Milestone
 
-**M2 — Target Management** is next: create/read/update/delete for
-`Target`, using the `target.New`/`target.Validate` already built in M1.
-Expect an in-memory store first (no DB until M6) and the first real
-question of where a repository-style interface should live, now that
-there's an actual caller for one.
+**M3 — HTTP Checker** is next: perform real HTTP/HTTPS requests against a
+`Target` and produce a `checker.CheckResult` (the M1 type, unused until
+now). Expect this to be the first place `checker.CheckResult`'s
+`Outcome` enum actually gets set by real logic (success vs.
+unexpected_status vs. timeout vs. connection_error), and the first
+component that needs a bounded per-request timeout distinct from the HTTP
+server's own timeouts.

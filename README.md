@@ -3,8 +3,9 @@
 Continuous HTTP/HTTPS API monitoring — reachability, latency, status
 correctness, uptime, and incident detection.
 
-**Status: under active development (Milestone 0 — foundation only). No
-monitoring functionality is implemented yet.**
+**Status: under active development (Milestone 2). Target management has a
+working REST API; actual API monitoring (checks, scheduling, incidents,
+alerts) is not implemented yet.**
 
 ## Problem statement
 
@@ -30,10 +31,15 @@ None of this is implemented yet — see [Current status](#current-status).
 
 ## Current status
 
-This repository currently contains only the Milestone 0 foundation:
-project structure, Go module setup, documentation, and empty package
-skeletons for future components. The binary builds and starts, but performs
-no monitoring.
+The domain model (`Target`, `CheckResult`, `Incident`) is implemented
+(M1), and target management now has a working REST API backed by
+in-memory storage (M2): create, list, get, update, and delete targets over
+HTTP, plus a `/health` liveness endpoint. See
+[docs/api.md](docs/api.md) for the full API reference.
+
+No HTTP checking, scheduling, incident detection, alerting, or durable
+persistence exists yet — the server accepts target configuration but does
+not act on it.
 
 ## High-level architecture
 
@@ -83,16 +89,16 @@ and eventual distributed scaling.
 
 | Milestone | Focus |
 |---|---|
-| M0 | Foundation & architecture *(current)* |
-| M1 | Domain model |
-| M2 | Target management |
+| M0 | Foundation & architecture *(done)* |
+| M1 | Domain model *(done)* |
+| M2 | Target management + REST backend + Docker foundation *(current)* |
 | M3 | HTTP checker |
 | M4 | Scheduler |
 | M5 | Concurrent workers |
-| M6 | Persistence |
+| M6 | Persistence (PostgreSQL) + Docker Compose |
 | M7 | Health & incident engine |
 | M8 | Alerting |
-| M9 | REST API |
+| M9 | Kafka / event-driven architecture |
 | M10 | Observability |
 | M11 | Productionization |
 | M12 | Scaling & hardening |
@@ -101,14 +107,27 @@ Details in [docs/roadmap.md](docs/roadmap.md).
 
 ## How to run the current project
 
-At this stage, the binary only starts up, logs a message, and exits
-cleanly on interrupt/termination — there is nothing to monitor yet.
-
 ```bash
 go run ./cmd/api-monitor
 ```
 
-Press `Ctrl+C` to stop it.
+This starts an HTTP server on `:8080` (configurable — see
+[docs/api.md](docs/api.md) and `docs/development.md`). Try it:
+
+```bash
+curl http://localhost:8080/health
+
+curl -X POST http://localhost:8080/api/v1/targets \
+  -d '{"name":"Example API","url":"https://example.com/health","method":"GET","interval":"30s","timeout":"5s","expected_status_code":200}'
+
+curl http://localhost:8080/api/v1/targets
+```
+
+Press `Ctrl+C` to stop it — shutdown is graceful. Data is in-memory only
+and is lost on restart (durable storage arrives in M6).
+
+A `Dockerfile` is also provided: `docker build -t api-monitor .` (not yet
+verified in this environment — see `CLAUDE.md`).
 
 ## Project philosophy
 

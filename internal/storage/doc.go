@@ -1,10 +1,10 @@
-// Package storage will persist targets, check results, and incidents, and
-// provide the read paths needed for history and reporting.
+// Package storage persists domain objects. Other packages depend on
+// storage through interfaces they define themselves (not defined here), so
+// the underlying persistence technology can change without forcing changes
+// on its consumers.
 //
-// Other packages depend on storage through interfaces they define
-// themselves (not defined here), so the underlying persistence technology
-// (starting with PostgreSQL, per the roadmap) can change without forcing
-// changes on its consumers.
-//
-// Not yet implemented (Milestone 0 is documentation-only for this package).
+// As of Milestone 2, it provides an in-memory implementation of
+// target.Repository (MemoryTargetRepository). PostgreSQL is planned for
+// M6, at which point a second implementation of the same interface will be
+// added here.
 package storage

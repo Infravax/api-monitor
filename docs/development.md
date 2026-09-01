@@ -3,6 +3,9 @@
 These principles apply to every milestone of API Monitor, not just
 Milestone 0. When in doubt, favor the option that keeps this list true.
 
+See [Useful commands](#useful-commands) at the end of this document for
+what actually works in the repository today.
+
 ## 1. Understand before implementing
 
 Every major component should have a documented reason for existing before
@@ -61,3 +64,27 @@ this means: keep interfaces where a second implementation is genuinely
 expected soon, avoid interfaces where there is only ever one implementation
 in sight, and don't add configuration knobs, queues, or abstraction layers
 for scenarios the project hasn't reached yet.
+
+As of M2, this also means: no Docker Compose file, because there is
+nothing yet for a single-service container to orchestrate against
+(that changes in M6, when PostgreSQL joins the stack); no Kafka, Redis,
+Kubernetes, or observability stack, because nothing in the current
+architecture creates a problem those would solve. See
+`docs/roadmap.md` for when each is expected to become justified.
+
+## Useful commands
+
+Run from the repository root. All of these are verified to work as of M2:
+
+```bash
+gofmt -w .          # format
+go vet ./...         # static analysis
+go build ./...        # build everything
+go test ./...          # run all tests
+go test -race ./...     # run all tests with the race detector
+docker build -t api-monitor .   # build the container image
+```
+
+`docker build` requires a local Docker daemon; it was reviewed carefully
+but not executed in the environment these docs were written in (no Docker
+available there) — verify it yourself before relying on it.

@@ -68,24 +68,14 @@ type NewParams struct {
 // returning it. Interval and Timeout have no default: they are policy
 // decisions the caller must make explicitly.
 func New(p NewParams) (Target, error) {
-	method := p.Method
-	if method == "" {
-		method = http.MethodGet
-	}
-
-	expectedStatusCode := p.ExpectedStatusCode
-	if expectedStatusCode == 0 {
-		expectedStatusCode = http.StatusOK
-	}
-
 	t := Target{
 		ID:                 id.New(),
 		Name:               strings.TrimSpace(p.Name),
 		URL:                strings.TrimSpace(p.URL),
-		Method:             strings.ToUpper(strings.TrimSpace(method)),
+		Method:             normalizeMethod(p.Method),
 		Interval:           p.Interval,
 		Timeout:            p.Timeout,
-		ExpectedStatusCode: expectedStatusCode,
+		ExpectedStatusCode: normalizeExpectedStatusCode(p.ExpectedStatusCode),
 		Enabled:            true,
 	}
 
@@ -93,6 +83,23 @@ func New(p NewParams) (Target, error) {
 		return Target{}, err
 	}
 	return t, nil
+}
+
+// normalizeMethod and normalizeExpectedStatusCode hold the same defaulting
+// rules used by New. Service.Update reuses them so create and update apply
+// identical defaults without duplicating the logic.
+func normalizeMethod(method string) string {
+	if method == "" {
+		method = http.MethodGet
+	}
+	return strings.ToUpper(strings.TrimSpace(method))
+}
+
+func normalizeExpectedStatusCode(code int) int {
+	if code == 0 {
+		return http.StatusOK
+	}
+	return code
 }
 
 // Validate checks that the Target satisfies all domain invariants. It is

@@ -1,11 +1,13 @@
 # Architecture
 
-> Status: Milestone 1 — the component descriptions below are still the
-> target design. As of M1, only the **domain model** (`Target`,
-> `CheckResult`, `Incident`) is actually implemented, living in the
-> `target`, `checker`, and `incident` packages respectively. Scheduling,
-> HTTP checking, persistence, alert delivery, and the REST API remain
-> unimplemented.
+> Status: Milestone 2 — Target Management now has a real, working REST API
+> (`internal/api`) backed by an in-memory repository (`internal/storage`).
+> The domain model (`Target`, `CheckResult`, `Incident`) is unchanged from
+> M1. Scheduling, HTTP checking, incident detection, alert delivery, and
+> durable persistence remain unimplemented — see
+> [Request architecture (Milestone 2)](#request-architecture-milestone-2)
+> below for what's actually built today, vs. the target design in
+> [Core components](#core-components).
 
 ## System overview
 
@@ -156,3 +158,58 @@ independently testable. A small `internal/id` leaf package (UUIDv4 via
 `crypto/rand`, no third-party dependency) is shared by all three
 constructors purely to avoid duplicating ID-generation code; it carries no
 business meaning of its own.
+
+## Request architecture (Milestone 2)
+
+This is what's actually running today for target management — a real
+subset of the [Core components](#core-components) design above (Target
+Management + Storage), not the full future system:
+
+```
+                    Client
+                      │
+                      ▼
+                HTTP Server (net/http, internal/api)
+                      │
+        Middleware: RequestID → Logging → Recovery
+                      │
+                      ▼
+                TargetHandler (internal/api)
+                      │
+                      ▼
+                target.Service (internal/target)
+                      │
+                      ▼
+                Target domain type + Validate (internal/target, M1)
+                      │
+                      ▼
+                target.Repository interface (internal/target)
+                      │
+                      ▼
+        MemoryTargetRepository (internal/storage) — in-memory only
+```
+
+Scheduler, Checker, Result Processor, Incident Manager, and Alert Manager
+from the [Core components](#core-components) table above are **not**
+wired into this flow yet — they remain future components. So does durable
+storage: `MemoryTargetRepository` is a `map[string]Target` behind a mutex;
+data is lost on restart. It exists to unblock the REST API before
+PostgreSQL arrives (M6), implementing `target.Repository` — an interface
+defined by `internal/target` (the consumer), not by `internal/storage`,
+so `target` and `api` never depend on a specific storage technology and
+swapping in a PostgreSQL-backed implementation in M6 requires no changes
+above the repository layer.
+
+The **`Handler → Service → Repository`** split mirrors the same
+single-reason-to-change principle as the top-level component table:
+`TargetHandler` only knows HTTP (status codes, JSON, path parsing);
+`target.Service` only knows application flow (fetch-then-validate-then-save
+for updates, defaulting for creates) and is unaware `net/http` exists;
+`Target.Validate` (M1) remains the single source of truth for what makes a
+target valid — the service and handler both defer to it rather than
+re-implementing validation rules at their own layer.
+
+Configuration (`internal/config`) and cross-cutting HTTP middleware
+(request ID, structured logging, panic recovery — `internal/api`) round
+out the M2 additions; both are described in `docs/development.md` and
+`docs/api.md`.
