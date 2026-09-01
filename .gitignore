@@ -1,0 +1,19 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go tooling
+*.prof
+
+# Environment / secrets
+.env
+.env.*
+
+# Editor/OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
